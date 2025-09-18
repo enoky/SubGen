@@ -1,8 +1,5 @@
 # Subgen: Automatic Subtitle Generator
 
-![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)
-![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
-
 Subgen is a Python script that automatically generates accurate, sentence-level `.srt` subtitle files from any audio or video file. It leverages the power of OpenAI's Whisper for transcription, `whisper-timestamped` for word-level accuracy, and spaCy for intelligent sentence segmentation.
 
 The result is perfectly timed subtitles that are grouped into natural, readable sentences, saving you hours of manual transcription and timing work.
