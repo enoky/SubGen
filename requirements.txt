@@ -1,0 +1,19 @@
+# PyTorch 2.8.0 for CUDA 12.8 environment
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.8.0
+torchvision==0.23.0
+torchaudio==2.8.0
+
+# For subtitle file creation and parsing
+srt
+
+# For sentence segmentation using NLP
+# NOTE: After installation, you must download the language model separately by running:
+# python -m spacy download en_core_web_lg
+spacy
+
+# For AI-powered audio transcription
+openai-whisper
+
+# A wrapper for Whisper that provides word-level timestamps
+whisper-timestamped
