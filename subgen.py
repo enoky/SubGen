@@ -1,3 +1,4 @@
+import re
 import torch
 import spacy
 import whisper
@@ -8,6 +9,10 @@ import logging
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+SENTENCE_END_RE = re.compile(r"[.!?][\"')\]]*$")
+PAUSE_SPLIT_SECONDS = 0.9
+
 
 def load_spacy_model():
     """
@@ -31,6 +36,7 @@ def load_spacy_model():
             logging.error(f"Failed to download or load spaCy model: {e}")
             raise
 
+
 def transcribe_audio(audio_path, model_id="large-v3-turbo"):
     """
     Transcribes an audio file using whisper-timestamped with word-level timestamps and VAD.
@@ -47,54 +53,78 @@ def transcribe_audio(audio_path, model_id="large-v3-turbo"):
         logging.error(f"Transcription failed: {e}")
         raise
 
+
+def _flatten_words(transcription):
+    words = []
+    for segment in transcription.get("segments", []):
+        for word in segment.get("words", []):
+            text = (word.get("text") or "").strip()
+            if not text:
+                continue
+            start = word.get("start")
+            end = word.get("end")
+            if start is None or end is None:
+                continue
+            words.append({"text": text, "start": float(start), "end": float(end)})
+    return words
+
+
+def _is_sentence_end(word_text):
+    return bool(SENTENCE_END_RE.search(word_text))
+
+
+def _finalize_sentence(buffer_words):
+    sentence_text = " ".join(w["text"] for w in buffer_words).strip()
+    sentence_text = re.sub(r"\s+", " ", sentence_text)
+    if sentence_text and not _is_sentence_end(sentence_text):
+        sentence_text += "."
+    return sentence_text
+
+
 def generate_srt_subtitles(transcription, nlp):
     """
-    Generates SRT subtitles with precise timestamps using word-level data from whisper-timestamped.
+    Generates SRT subtitles with reliable timestamps by forcing one complete sentence per subtitle.
+
+    Sentence boundaries are taken from punctuation first and from long pauses as a fallback,
+    which keeps each subtitle aligned to spoken timing.
     """
-    if not transcription.get("segments"):
-        logging.warning("No transcription segments to process.")
+    words = _flatten_words(transcription)
+    if not words:
+        logging.warning("No word-level transcription to process.")
         return []
 
-    # Build full text and track word positions
-    full_text = ""
-    word_list = []
-    for segment in transcription["segments"]:
-        for word in segment["words"]:
-            word_text = word["text"]
-            start_char = len(full_text)
-            full_text += word_text + " "
-            end_char = len(full_text) - 1
-            word_list.append({
-                "text": word_text,
-                "start_time": word["start"],
-                "end_time": word["end"],
-                "start_char": start_char,
-                "end_char": end_char
-            })
-    full_text = full_text.strip()
-
-    # Segment text into sentences using spaCy
-    doc = nlp(full_text)
     subtitles = []
-    for i, sent in enumerate(doc.sents):
-        sentence_text = sent.text.strip()
-        start_char = sent.start_char
-        end_char = sent.end_char
-        # Find words corresponding to the sentence
-        sentence_words = [w for w in word_list if w["start_char"] >= start_char and w["end_char"] <= end_char]
-        if sentence_words:
-            start_time = sentence_words[0]["start_time"]
-            end_time = sentence_words[-1]["end_time"]
-            subtitle = srt.Subtitle(
-                index=i + 1,
-                start=timedelta(seconds=start_time),
-                end=timedelta(seconds=end_time),
-                content=sentence_text
+    sentence_buffer = []
+
+    for idx, word in enumerate(words):
+        sentence_buffer.append(word)
+
+        next_word = words[idx + 1] if idx + 1 < len(words) else None
+        pause_to_next = (next_word["start"] - word["end"]) if next_word else 0.0
+
+        ends_with_punctuation = _is_sentence_end(word["text"])
+        long_pause_boundary = next_word is not None and pause_to_next >= PAUSE_SPLIT_SECONDS
+        last_word = next_word is None
+
+        should_close_sentence = ends_with_punctuation or long_pause_boundary or last_word
+        if not should_close_sentence:
+            continue
+
+        sentence_text = _finalize_sentence(sentence_buffer)
+        if sentence_text:
+            subtitles.append(
+                srt.Subtitle(
+                    index=len(subtitles) + 1,
+                    start=timedelta(seconds=sentence_buffer[0]["start"]),
+                    end=timedelta(seconds=sentence_buffer[-1]["end"]),
+                    content=sentence_text,
+                )
             )
-            subtitles.append(subtitle)
-        else:
-            logging.warning(f"No words found for sentence: {sentence_text}")
+
+        sentence_buffer = []
+
     return subtitles
+
 
 def save_srt_file(subtitles, output_path="output.srt"):
     """
@@ -109,6 +139,7 @@ def save_srt_file(subtitles, output_path="output.srt"):
         logging.error(f"Failed to save SRT file: {e}")
         raise
 
+
 def main(audio_path, output_srt_path="autogen-subs.srt"):
     """
     Main function to transcribe audio and generate a precise SRT file.
@@ -122,6 +153,7 @@ def main(audio_path, output_srt_path="autogen-subs.srt"):
     except Exception as e:
         logging.error(f"Script execution failed: {e}")
         raise
+
 
 if __name__ == "__main__":
     # Replace "audio.wav" with your audio file path
