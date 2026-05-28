@@ -106,7 +106,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--vad-method",
         choices=("pyannote", "silero"),
-        default="pyannote",
+        default="silero",
         help="Voice activity detector used by WhisperX.",
     )
     parser.add_argument(
@@ -158,6 +158,8 @@ def load_sentence_segmenter() -> spacy.Language:
 
 
 def run_whisperx(args: argparse.Namespace, audio_path: Path) -> dict[str, Any]:
+    patch_legacy_torchaudio_for_pyannote_import()
+
     device = resolve_device(args.device)
     compute_type = resolve_compute_type(args.compute_type, device)
     model_dir = str(args.model_dir) if args.model_dir else None
@@ -210,6 +212,23 @@ def run_whisperx(args: argparse.Namespace, audio_path: Path) -> dict[str, Any]:
     free_torch_memory()
 
     return aligned
+
+
+def patch_legacy_torchaudio_for_pyannote_import() -> None:
+    # WhisperX imports pyannote unconditionally through whisperx.vads, even when
+    # Silero VAD is selected. pyannote.audio 3.4 still references torchaudio APIs
+    # removed from torchaudio 2.11 during import, so provide the import-time names.
+    import torchaudio
+
+    if not hasattr(torchaudio, "AudioMetaData"):
+        torchaudio.AudioMetaData = object
+
+    if not hasattr(torchaudio, "list_audio_backends"):
+
+        def list_audio_backends() -> list[str]:
+            return ["soundfile"]
+
+        torchaudio.list_audio_backends = list_audio_backends
 
 
 def free_torch_memory() -> None:
