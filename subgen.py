@@ -408,7 +408,7 @@ def seconds_to_timedelta(seconds: float) -> timedelta:
 def main() -> int:
     args = parse_args()
     audio_path = args.input
-    output_path = args.output or audio_path.with_suffix(".srt")
+    output_path = args.output or Path("./project/autogen-subs.srt")
 
     if not audio_path.exists():
         raise FileNotFoundError(f"Input audio file not found: {audio_path}")
@@ -418,6 +418,7 @@ def main() -> int:
     if not cues:
         raise RuntimeError("WhisperX did not produce any sentence-level subtitle cues.")
 
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     write_srt(cues, output_path)
     print(f"Wrote {len(cues)} sentence-level subtitles to {output_path}")
     return 0
