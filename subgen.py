@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import gc
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -16,6 +16,14 @@ import whisperx
 
 DEFAULT_INPUT = Path("audio.wav")
 LANGUAGE = "en"
+SPACY_MODEL = "en_core_web_lg"
+DEFAULT_PUNCTUATION_MODEL = "oliverguhr/fullstop-punctuation-multilang-large"
+
+# Labels the restoration model emits; only these signal a sentence boundary.
+SENTENCE_END_PUNCT = {".", "?", "!"}
+RESTORABLE_PUNCT = {".", ",", "?", "-", ":"}
+# Trailing punctuation stripped from a raw word before the model re-punctuates it.
+_TRAILING_PUNCT_RE = re.compile(r"[.,;:!?…]+$")
 
 
 @dataclass(frozen=True)
@@ -51,7 +59,7 @@ def parse_args() -> argparse.Namespace:
         "-o",
         "--output",
         type=Path,
-        help="SRT output path. Defaults to <input stem>.srt.",
+        help="SRT output path. Defaults to ./project/autogen-subs.srt.",
     )
     parser.add_argument(
         "--model",
@@ -122,6 +130,55 @@ def parse_args() -> argparse.Namespace:
         help="VAD offset threshold.",
     )
     parser.add_argument(
+        "--punctuation-model",
+        default=DEFAULT_PUNCTUATION_MODEL,
+        help=(
+            "Hugging Face model used to restore sentence punctuation before "
+            "segmentation. This is what lets subgen recover sentence boundaries "
+            "when Whisper drops them, keeping one sentence per subtitle."
+        ),
+    )
+    parser.add_argument(
+        "--no-restore-punctuation",
+        dest="restore_punctuation",
+        action="store_false",
+        help="Skip punctuation restoration and segment Whisper's raw output directly.",
+    )
+    parser.set_defaults(restore_punctuation=True)
+    parser.add_argument(
+        "--max-sentence-seconds",
+        type=float,
+        default=12.0,
+        help=(
+            "A cue longer than this (seconds) is probed for a dropped sentence "
+            "boundary. Shorter cues keep Whisper's punctuation untouched."
+        ),
+    )
+    parser.add_argument(
+        "--max-sentence-words",
+        type=int,
+        default=48,
+        help="A cue with more words than this is also probed for hidden sentences.",
+    )
+    parser.add_argument(
+        "--merge-gap-seconds",
+        type=float,
+        default=0.5,
+        help=(
+            "When a cue begins mid-sentence (a lowercase word Whisper did not "
+            "capitalize) and follows the previous cue within this gap, the two "
+            "are merged into one sentence. A larger gap is treated as a real "
+            "sentence break and the word is simply capitalized."
+        ),
+    )
+    parser.add_argument(
+        "--no-repair-oversplits",
+        dest="repair_oversplits",
+        action="store_false",
+        help="Disable merging/recapitalizing of sentences split across cues.",
+    )
+    parser.set_defaults(repair_oversplits=True)
+    parser.add_argument(
         "--print-progress",
         action="store_true",
         help="Print WhisperX transcription and alignment progress.",
@@ -152,8 +209,15 @@ def normalize_text(text: str) -> str:
 
 
 def load_sentence_segmenter() -> spacy.Language:
-    nlp = spacy.blank("en")
-    nlp.add_pipe("sentencizer")
+    """Prefer the trained pipeline's parser, which segments sentences using
+    statistical cues (casing, syntax) rather than punctuation alone. Fall back
+    to a punctuation-only sentencizer if the model is not installed."""
+    try:
+        nlp = spacy.load(SPACY_MODEL, exclude=["ner", "lemmatizer"])
+    except OSError:
+        nlp = spacy.blank("en")
+    if not nlp.has_pipe("parser") and not nlp.has_pipe("senter"):
+        nlp.add_pipe("sentencizer")
     return nlp
 
 
@@ -319,35 +383,221 @@ def coerce_float(value: Any) -> float | None:
         return None
 
 
-def sentence_cues(aligned: dict[str, Any]) -> list[SentenceCue]:
+def load_punctuation_model(model_name: str) -> Any:
+    """Build the Hugging Face token-classification pipeline once and wrap it in a
+    PunctuationModel so we can reuse its chunking/word-mapping in predict().
+
+    We construct the pipeline directly because the library's own constructor
+    still passes the removed `grouped_entities` kwarg and hardcodes GPU device 0.
+    """
+    from deepmultilingualpunctuation import PunctuationModel
+    from transformers import pipeline
+
+    model = PunctuationModel.__new__(PunctuationModel)
+    model.pipe = pipeline(
+        "ner",
+        model=model_name,
+        aggregation_strategy="none",
+        device=0 if torch.cuda.is_available() else -1,
+    )
+    return model
+
+
+def restore_word_punctuation(
+    timed_words: list[TimedWord], model: Any
+) -> tuple[str, list[TimedWord]]:
+    """Re-punctuate and re-case a word stream so sentence boundaries survive even
+    when Whisper emitted a long, unpunctuated run of speech.
+
+    Whisper's word timings are kept; only each word's text is rewritten, and the
+    character offsets are recomputed (local to this slice) so the segmenter still
+    maps spans back to words. Returns the rebuilt transcript and word list.
+    """
+    cores = [_TRAILING_PUNCT_RE.sub("", word.text).strip() or word.text for word in timed_words]
+    predictions = model.predict(cores)
+
+    rebuilt: list[TimedWord] = []
+    parts: list[str] = []
+    cursor = 0
+    start_of_sentence = True
+    for word, core, prediction in zip(timed_words, cores, predictions):
+        label = prediction[1] if isinstance(prediction[1], str) else ""
+        text = core
+        if start_of_sentence and text[:1].isalpha() and text[0].islower():
+            text = text[0].upper() + text[1:]
+        if label in RESTORABLE_PUNCT:
+            text += label
+        start_of_sentence = label in SENTENCE_END_PUNCT
+
+        if parts:
+            parts.append(" ")
+            cursor += 1
+        char_start = cursor
+        parts.append(text)
+        cursor += len(text)
+        rebuilt.append(replace(word, text=text, char_start=char_start, char_end=cursor))
+
+    return "".join(parts), rebuilt
+
+
+def segment_sentences(
+    nlp: spacy.Language, transcript: str, words: list[TimedWord]
+) -> list[tuple[str, list[TimedWord]]]:
+    """Split a transcript into sentences, pairing each with its timed words. The
+    word char offsets must already be consistent with `transcript`."""
+    nlp.max_length = max(nlp.max_length, len(transcript) + 1)
+    out: list[tuple[str, list[TimedWord]]] = []
+    for sentence in nlp(transcript).sents:
+        text = normalize_text(sentence.text)
+        if not text:
+            continue
+        span = words_for_span(words, sentence.start_char, sentence.end_char)
+        if span:
+            out.append((text, span))
+    return out
+
+
+def cue_duration(words: list[TimedWord]) -> float | None:
+    start = first_time(words, "start", "fallback_start")
+    end = last_time(words, "end", "fallback_end")
+    if start is None or end is None:
+        return None
+    return end - start
+
+
+def is_runon_candidate(words: list[TimedWord], args: argparse.Namespace) -> bool:
+    """A cue long enough that it may hide more than one sentence behind missing
+    Whisper punctuation, and is therefore worth probing with the model."""
+    if len(words) > args.max_sentence_words:
+        return True
+    duration = cue_duration(words)
+    return duration is not None and duration > args.max_sentence_seconds
+
+
+def make_cue(text: str, words: list[TimedWord]) -> SentenceCue | None:
+    start = first_time(words, "start", "fallback_start")
+    end = last_time(words, "end", "fallback_end")
+    if start is None or end is None:
+        return None
+    if end <= start:
+        end = start + 0.001
+    return SentenceCue(text=text, start=start, end=end)
+
+
+def sentence_cues(aligned: dict[str, Any], args: argparse.Namespace) -> list[SentenceCue]:
     transcript, timed_words = build_timed_words(aligned)
     if not transcript or not timed_words:
         return []
 
     nlp = load_sentence_segmenter()
-    nlp.max_length = max(nlp.max_length, len(transcript) + 1)
-    doc = nlp(transcript)
+    base = segment_sentences(nlp, transcript, timed_words)
 
-    cues: list[SentenceCue] = []
-    for sentence in doc.sents:
-        text = normalize_text(sentence.text)
-        if not text:
-            continue
+    # Hybrid restoration: keep Whisper's own punctuation for every cue, and only
+    # re-punctuate the long cues that may hide a dropped sentence boundary. A
+    # probed cue is replaced only when the model actually finds extra sentences;
+    # otherwise its original Whisper text is left untouched.
+    model = None
+    if args.restore_punctuation and any(is_runon_candidate(words, args) for _, words in base):
+        try:
+            model = load_punctuation_model(args.punctuation_model)
+        except Exception as error:  # noqa: BLE001 - degrade gracefully, never crash here
+            print(
+                f"Warning: punctuation restoration unavailable ({error}); "
+                "keeping Whisper's raw punctuation."
+            )
 
-        words = words_for_span(timed_words, sentence.start_char, sentence.end_char)
-        if not words:
-            continue
+    groups: list[tuple[str, list[TimedWord]]] = []
+    for text, words in base:
+        if model is not None and is_runon_candidate(words, args):
+            split = resplit_runon(nlp, words, model)
+            if len(split) > 1:
+                groups.extend(split)
+                continue
+        groups.append((text, words))
 
-        start = first_time(words, "start", "fallback_start")
-        end = last_time(words, "end", "fallback_end")
-        if start is None or end is None:
-            continue
-        if end <= start:
-            end = start + 0.001
+    if args.repair_oversplits:
+        groups = repair_oversplit_sentences(groups, args)
 
-        cues.append(SentenceCue(text=text, start=start, end=end))
+    return [cue for cue in (make_cue(text, words) for text, words in groups) if cue]
 
-    return cues
+
+def repair_oversplit_sentences(
+    groups: list[tuple[str, list[TimedWord]]], args: argparse.Namespace
+) -> list[tuple[str, list[TimedWord]]]:
+    """Repair single sentences that Whisper split across two cues.
+
+    A cue that begins with a lowercase word is one Whisper did not treat as a
+    sentence start. If it also follows the previous cue within a short gap, it is
+    a genuine continuation and the two are merged; otherwise it is a real new
+    sentence whose leading word is simply recapitalized. Merges never exceed the
+    run-on length limits, so long sentences stay split for readability.
+    """
+    repaired: list[tuple[str, list[TimedWord]]] = []
+    for text, words in groups:
+        if repaired and starts_lowercase(text):
+            prev_text, prev_words = repaired[-1]
+            gap = inter_cue_gap(prev_words, words)
+            combined = prev_words + words
+            if (
+                gap is not None
+                and gap <= args.merge_gap_seconds
+                and len(combined) <= args.max_sentence_words
+                and not is_runon_candidate(combined, args)
+            ):
+                repaired[-1] = (join_continuation(prev_text, text), combined)
+                continue
+            text = capitalize_first_letter(text)
+        repaired.append((text, words))
+    return repaired
+
+
+def starts_lowercase(text: str) -> bool:
+    for char in text:
+        if char.isalpha():
+            return char.islower()
+    return False
+
+
+def capitalize_first_letter(text: str) -> str:
+    for index, char in enumerate(text):
+        if char.isalpha():
+            return text[:index] + char.upper() + text[index + 1 :]
+    return text
+
+
+def join_continuation(first: str, second: str) -> str:
+    first = first.rstrip()
+    if first and first[-1] in ".?!…":
+        first = first[:-1].rstrip()
+        separator = " " if first and first[-1] in ",;:—-" else ", "
+    elif first and first[-1] in ",;:—-":
+        separator = " "
+    else:
+        separator = ", "
+    return f"{first}{separator}{second}"
+
+
+def inter_cue_gap(
+    prev_words: list[TimedWord], words: list[TimedWord]
+) -> float | None:
+    prev_end = last_time(prev_words, "end", "fallback_end")
+    start = first_time(words, "start", "fallback_start")
+    if prev_end is None or start is None:
+        return None
+    return start - prev_end
+
+
+def resplit_runon(
+    nlp: spacy.Language, words: list[TimedWord], model: Any
+) -> list[tuple[str, list[TimedWord]]]:
+    """Re-punctuate one long cue's words and re-segment them. Returns the new
+    sentence groups, or an empty list if restoration fails."""
+    try:
+        transcript, rebuilt = restore_word_punctuation(words, model)
+        return segment_sentences(nlp, transcript, rebuilt)
+    except Exception as error:  # noqa: BLE001 - keep the original cue on any failure
+        print(f"Warning: could not re-punctuate a long cue ({error}); keeping it as-is.")
+        return []
 
 
 def words_for_span(
@@ -414,7 +664,7 @@ def main() -> int:
         raise FileNotFoundError(f"Input audio file not found: {audio_path}")
 
     aligned = run_whisperx(args, audio_path)
-    cues = sentence_cues(aligned)
+    cues = sentence_cues(aligned, args)
     if not cues:
         raise RuntimeError("WhisperX did not produce any sentence-level subtitle cues.")
 
