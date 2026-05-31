@@ -207,7 +207,6 @@ marimo/_lsp/
 __marimo__/
 
 # user ignores
-AGENTS.md
 audio.wav
 audio.srt
 /.codex
