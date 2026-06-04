@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import bisect
+import difflib
 import gc
 import re
+import unicodedata
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
@@ -25,6 +28,24 @@ RESTORABLE_PUNCT = {".", ",", "?", "-", ":"}
 # Trailing punctuation stripped from a raw word before the model re-punctuates it.
 _TRAILING_PUNCT_RE = re.compile(r"[.,;:!?…]+$")
 
+# Word tokenizer used to align the transcript against the original script. Mirrors
+# edit_subs_from_script.py so the two tools agree on what counts as a word.
+TOKEN_RE = re.compile(r"[^\W_]+(?:['’][^\W_]+)?", re.UNICODE)
+
+# Common mojibake sequences seen when a UTF-8 script is mis-decoded as Latin-1.
+MOJIBAKE_REPLACEMENTS = {
+    "â€™": "’",
+    "â€˜": "‘",
+    "â€œ": "“",
+    "â€": "”",
+    "â€”": "—",
+    "â€“": "–",
+    "â€¦": "…",
+    "â€¢": "•",
+    "Â ": " ",
+    "Â": "",
+}
+
 
 @dataclass(frozen=True)
 class TimedWord:
@@ -42,6 +63,13 @@ class SentenceCue:
     text: str
     start: float
     end: float
+
+
+@dataclass(frozen=True)
+class Token:
+    key: str
+    start: int
+    end: int
 
 
 def parse_args() -> argparse.Namespace:
@@ -128,6 +156,25 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.363,
         help="VAD offset threshold.",
+    )
+    parser.add_argument(
+        "--script",
+        type=Path,
+        help=(
+            "Original script text file (e.g. ./project/original-script.txt). When "
+            "given, sentence boundaries are taken from the script's real punctuation "
+            "and the script's exact wording is used for each cue; WhisperX only "
+            "supplies the timings. This bypasses punctuation restoration entirely."
+        ),
+    )
+    parser.add_argument(
+        "--min-ratio",
+        type=float,
+        default=0.70,
+        help=(
+            "When --script is used, warn if transcript/script token similarity falls "
+            "below this ratio (a sign the script and audio do not match)."
+        ),
     )
     parser.add_argument(
         "--punctuation-model",
@@ -521,6 +568,175 @@ def sentence_cues(aligned: dict[str, Any], args: argparse.Namespace) -> list[Sen
     return [cue for cue in (make_cue(text, words) for text, words in groups) if cue]
 
 
+def sentence_cues_from_script(aligned: dict[str, Any], args: argparse.Namespace) -> list[SentenceCue]:
+    """Build one cue per script sentence, timed by aligning WhisperX's word stream
+    to the original script.
+
+    The script supplies the wording and the (correctly punctuated) sentence
+    boundaries; WhisperX supplies only the timings. This sidesteps punctuation
+    restoration and the over-split repairs the audio-only path needs.
+    """
+    script_path: Path = args.script
+    if not script_path.exists():
+        raise FileNotFoundError(f"Script file not found: {script_path}")
+    script_text = repair_mojibake(script_path.read_text(encoding="utf-8-sig"))
+
+    _, timed_words = build_timed_words(aligned)
+    if not timed_words or not script_text.strip():
+        return []
+
+    nlp = load_sentence_segmenter()
+    cues, ratio = build_script_cues(nlp, script_text, timed_words)
+    if not cues:
+        return []
+
+    print(f"Script alignment ratio: {ratio:.3f}")
+    if ratio < args.min_ratio:
+        print(
+            f"Warning: script alignment ratio {ratio:.3f} is below --min-ratio "
+            f"{args.min_ratio:.3f}; check that the script matches the audio. "
+            "Subtitles were still written, but timings may be unreliable."
+        )
+    return cues
+
+
+def build_script_cues(
+    nlp: spacy.Language, script_text: str, timed_words: list[TimedWord]
+) -> tuple[list[SentenceCue], float]:
+    """Align timed transcript words to the script, then time each script sentence."""
+    # Flatten timed words into alignment keys. A word may yield zero keys (pure
+    # punctuation) or several; each key remembers which timed word it came from so
+    # its timing can be recovered after alignment.
+    transcript_keys: list[str] = []
+    key_to_word: list[int] = []
+    for index, word in enumerate(timed_words):
+        for token in tokenize(word.text):
+            transcript_keys.append(token.key)
+            key_to_word.append(index)
+
+    script_tokens = tokenize(script_text)
+    script_keys = [token.key for token in script_tokens]
+    if not transcript_keys or not script_keys:
+        return [], 0.0
+
+    mapped, ratio, _ = map_caption_tokens_to_script(transcript_keys, script_keys)
+    sentences = script_sentence_token_ranges(nlp, script_text, script_tokens)
+
+    cues: list[SentenceCue] = []
+    last_end = 0.0
+    for text, lo, hi in sentences:
+        start: float | None = None
+        end: float | None = None
+        for key_index, position in enumerate(mapped):
+            if position is None or not (lo <= position < hi):
+                continue
+            word = timed_words[key_to_word[key_index]]
+            word_start = word.start if word.start is not None else word.fallback_start
+            word_end = word.end if word.end is not None else word.fallback_end
+            if word_start is not None:
+                start = word_start if start is None else min(start, word_start)
+            if word_end is not None:
+                end = word_end if end is None else max(end, word_end)
+
+        if start is None or end is None:
+            # No transcript words aligned to this sentence (e.g. a line the speaker
+            # skipped). Drop it rather than emit a cue with no timing.
+            continue
+
+        start = max(start, last_end)
+        if end <= start:
+            end = start + 0.001
+        cues.append(SentenceCue(text=normalize_text(text), start=start, end=end))
+        last_end = end
+
+    return cues, ratio
+
+
+def script_sentence_token_ranges(
+    nlp: spacy.Language, script_text: str, script_tokens: list[Token]
+) -> list[tuple[str, int, int]]:
+    """Segment the script into sentences and express each as a half-open span of
+    script-token indices, so aligned transcript positions can be tested against it."""
+    nlp.max_length = max(nlp.max_length, len(script_text) + 1)
+    token_starts = [token.start for token in script_tokens]
+    ranges: list[tuple[str, int, int]] = []
+    for sentence in nlp(script_text).sents:
+        text = normalize_text(sentence.text)
+        if not text:
+            continue
+        lo = bisect.bisect_left(token_starts, sentence.start_char)
+        hi = bisect.bisect_left(token_starts, sentence.end_char)
+        if hi > lo:
+            ranges.append((text, lo, hi))
+    return ranges
+
+
+def normalize_token(token: str) -> str:
+    token = token.casefold().replace("‘", "'").replace("’", "'")
+    token = unicodedata.normalize("NFKD", token)
+    token = "".join(char for char in token if not unicodedata.combining(char))
+    return re.sub(r"['`]", "", token)
+
+
+def tokenize(text: str) -> list[Token]:
+    tokens: list[Token] = []
+    for match in TOKEN_RE.finditer(text):
+        key = normalize_token(match.group(0))
+        if key:
+            tokens.append(Token(key=key, start=match.start(), end=match.end()))
+    return tokens
+
+
+def repair_mojibake(text: str) -> str:
+    for broken, fixed in MOJIBAKE_REPLACEMENTS.items():
+        text = text.replace(broken, fixed)
+    return text
+
+
+def map_caption_tokens_to_script(
+    caption_keys: list[str], script_keys: list[str]
+) -> tuple[list[float | None], float, int]:
+    """Map each transcript token to a (fractional) script-token position via a
+    difflib alignment. Replacements interpolate across the matched span; deletions
+    are pinned just before the next script token. Positions are forced non-decreasing
+    so sentence spans can be tested with a simple range check. Same logic as
+    edit_subs_from_script.py."""
+    matcher = difflib.SequenceMatcher(None, caption_keys, script_keys, autojunk=False)
+    mapped: list[float | None] = [None] * len(caption_keys)
+    equal_tokens = 0
+
+    for tag, cap_start, cap_end, script_start, script_end in matcher.get_opcodes():
+        cap_len = cap_end - cap_start
+        script_len = script_end - script_start
+
+        if tag == "equal":
+            equal_tokens += cap_len
+            for offset in range(cap_len):
+                mapped[cap_start + offset] = float(script_start + offset)
+        elif tag == "replace" and cap_len:
+            if script_len:
+                for offset in range(cap_len):
+                    relative = (offset + 0.5) / cap_len
+                    script_offset = min(script_len - 1, int(relative * script_len))
+                    mapped[cap_start + offset] = float(script_start + script_offset)
+            else:
+                for offset in range(cap_len):
+                    mapped[cap_start + offset] = float(script_start)
+        elif tag == "delete":
+            for offset in range(cap_len):
+                mapped[cap_start + offset] = float(script_start) - 0.5
+
+    last_seen = -0.5
+    for index, value in enumerate(mapped):
+        if value is None:
+            continue
+        value = max(value, last_seen)
+        mapped[index] = value
+        last_seen = value
+
+    return mapped, matcher.ratio(), equal_tokens
+
+
 def repair_oversplit_sentences(
     groups: list[tuple[str, list[TimedWord]]], args: argparse.Namespace
 ) -> list[tuple[str, list[TimedWord]]]:
@@ -664,7 +880,10 @@ def main() -> int:
         raise FileNotFoundError(f"Input audio file not found: {audio_path}")
 
     aligned = run_whisperx(args, audio_path)
-    cues = sentence_cues(aligned, args)
+    if args.script:
+        cues = sentence_cues_from_script(aligned, args)
+    else:
+        cues = sentence_cues(aligned, args)
     if not cues:
         raise RuntimeError("WhisperX did not produce any sentence-level subtitle cues.")
 
