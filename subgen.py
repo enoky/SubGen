@@ -4,9 +4,12 @@ import argparse
 import bisect
 import difflib
 import gc
+import logging
 import re
 import sys
+import time
 import unicodedata
+import warnings
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
@@ -15,6 +18,7 @@ from typing import Any
 import spacy
 import srt
 import torch
+from tqdm import tqdm
 
 
 def _preload_cuda12_cublas() -> None:
@@ -37,6 +41,11 @@ def _preload_cuda12_cublas() -> None:
 
 _preload_cuda12_cublas()
 
+# Triton is only used by torch.compile, which subgen never calls, and Silero VAD
+# still ships a TorchScript model; neither notice is actionable here.
+logging.getLogger("torch.utils.flop_counter").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", message=r"`torch\.jit\.load` is deprecated", category=FutureWarning)
+
 import whisperx  # noqa: E402
 
 
@@ -46,6 +55,9 @@ SPACY_MODEL = "en_core_web_lg"
 DEFAULT_PUNCTUATION_MODEL = "oliverguhr/fullstop-punctuation-multilang-large"
 # GPUs below this much VRAM get int8 weights and smaller batches so large-v3 fits (e.g. 4 GB laptops).
 LOW_VRAM_GIB = 6.0
+# Segments aligned per whisperx.align call; small enough for a smooth progress bar.
+ALIGN_CHUNK_SEGMENTS = 25
+_START_TIME = time.monotonic()
 
 # Labels the restoration model emits; only these signal a sentence boundary.
 SENTENCE_END_PUNCT = {".", "?", "!"}
@@ -254,10 +266,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.set_defaults(repair_oversplits=True)
     parser.add_argument(
-        "--print-progress",
-        action="store_true",
-        help="Print WhisperX transcription and alignment progress.",
+        "--no-progress",
+        dest="progress",
+        action="store_false",
+        help="Hide the stage messages and transcription/alignment progress bars.",
     )
+    parser.set_defaults(progress=True)
     parser.add_argument(
         "--verbose",
         action="store_true",
@@ -323,7 +337,13 @@ def run_whisperx(args: argparse.Namespace, audio_path: Path) -> dict[str, Any]:
     if args.threads > 0:
         torch.set_num_threads(args.threads)
 
+    stage(args, f"Loading audio: {audio_path}")
     audio = whisperx.load_audio(str(audio_path))
+    stage(
+        args,
+        f"Audio is {format_clock(len(audio) / whisperx.audio.SAMPLE_RATE)}. Loading {args.model} "
+        f"on {device} ({compute_type}, batch size {batch_size})",
+    )
     model = whisperx.load_model(
         args.model,
         device=device,
@@ -341,33 +361,97 @@ def run_whisperx(args: argparse.Namespace, audio_path: Path) -> dict[str, Any]:
         threads=args.threads if args.threads > 0 else 4,
     )
 
-    result = model.transcribe(
-        audio,
-        batch_size=batch_size,
-        chunk_size=args.chunk_size,
-        print_progress=args.print_progress,
-        verbose=args.verbose,
-    )
+    stage(args, "Detecting speech and transcribing")
+    with TranscriptionProgress(model, enabled=args.progress):
+        result = model.transcribe(
+            audio,
+            batch_size=batch_size,
+            chunk_size=args.chunk_size,
+            verbose=args.verbose,
+        )
     del model
     free_torch_memory()
 
+    stage(args, "Loading alignment model")
     align_model, align_metadata = whisperx.load_align_model(
         language_code=LANGUAGE,
         device=device,
         model_dir=model_dir,
     )
-    aligned = whisperx.align(
-        result["segments"],
-        align_model,
-        align_metadata,
-        audio,
-        device,
-        print_progress=args.print_progress,
-    )
+    # whisperx.align handles each segment independently, so aligning in chunks
+    # gives the same result while letting us report real progress.
+    segments = result["segments"]
+    aligned: dict[str, Any] = {"segments": [], "word_segments": []}
+    with tqdm(
+        total=len(segments), desc="Aligning", unit="seg", disable=not args.progress, dynamic_ncols=True
+    ) as bar:
+        for start in range(0, len(segments), ALIGN_CHUNK_SEGMENTS):
+            chunk = segments[start : start + ALIGN_CHUNK_SEGMENTS]
+            part = whisperx.align(chunk, align_model, align_metadata, audio, device)
+            aligned["segments"].extend(part["segments"])
+            aligned["word_segments"].extend(part["word_segments"])
+            bar.update(len(chunk))
     del align_model
     free_torch_memory()
 
     return aligned
+
+
+class TranscriptionProgress:
+    """Show a tqdm bar with an ETA while WhisperX transcribes.
+
+    WhisperX's own print_progress is useless here: the transformers pipeline
+    collects every batch before yielding, so all its reports arrive at the end.
+    Instead, the VAD merge step gives the total segment count and each batch
+    forward pass advances the bar as it completes. Both are wrapped on this
+    model instance only and restored on exit."""
+
+    def __init__(self, model: Any, enabled: bool) -> None:
+        self.model = model
+        self.enabled = enabled
+        self.bar: tqdm | None = None
+
+    def __enter__(self) -> TranscriptionProgress:
+        if not self.enabled:
+            return self
+        vad = self.model.vad_model
+        merge_chunks = vad.merge_chunks
+        forward = self.model._forward
+
+        def counting_merge_chunks(*args: Any, **kwargs: Any) -> Any:
+            segments = merge_chunks(*args, **kwargs)
+            # Created once speech detection is done so it does not skew the ETA.
+            self.bar = tqdm(total=len(segments), desc="Transcribing", unit="seg", dynamic_ncols=True)
+            return segments
+
+        def counting_forward(model_inputs: dict[str, Any]) -> Any:
+            outputs = forward(model_inputs)
+            if self.bar is not None:
+                self.bar.update(len(model_inputs["inputs"]))
+            return outputs
+
+        vad.merge_chunks = counting_merge_chunks
+        self.model._forward = counting_forward
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if not self.enabled:
+            return
+        del self.model.vad_model.merge_chunks
+        del self.model._forward
+        if self.bar is not None:
+            self.bar.close()
+
+
+def format_clock(seconds: float) -> str:
+    minutes, secs = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes:02d}:{secs:02d}"
+
+
+def stage(args: argparse.Namespace, message: str) -> None:
+    if args.progress:
+        print(f"[{format_clock(time.monotonic() - _START_TIME)}] {message}", flush=True)
 
 
 def patch_legacy_torchaudio_for_pyannote_import() -> None:
@@ -599,7 +683,13 @@ def sentence_cues(aligned: dict[str, Any], args: argparse.Namespace) -> list[Sen
             )
 
     groups: list[tuple[str, list[TimedWord]]] = []
-    for text, words in base:
+    for text, words in tqdm(
+        base,
+        desc="Restoring punctuation",
+        unit="cue",
+        disable=model is None or not args.progress,
+        dynamic_ncols=True,
+    ):
         if model is not None and is_runon_candidate(words, args):
             split = resplit_runon(nlp, words, model)
             if len(split) > 1:
@@ -926,14 +1016,17 @@ def main() -> int:
 
     aligned = run_whisperx(args, audio_path)
     if args.script:
+        stage(args, f"Matching transcript to script: {args.script}")
         cues = sentence_cues_from_script(aligned, args)
     else:
+        stage(args, "Building sentence cues")
         cues = sentence_cues(aligned, args)
     if not cues:
         raise RuntimeError("WhisperX did not produce any sentence-level subtitle cues.")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     write_srt(cues, output_path)
+    stage(args, "Done")
     print(f"Wrote {len(cues)} sentence-level subtitles to {output_path}")
     return 0
 

@@ -3190,6 +3190,7 @@ dependencies = [
     { name = "torch" },
     { name = "torchaudio" },
     { name = "torchvision" },
+    { name = "tqdm" },
     { name = "whisperx" },
 ]
 
@@ -3210,6 +3211,7 @@ requires-dist = [
     { name = "torch", specifier = ">=2.15.0", index = "https://download.pytorch.org/whl/cu132" },
     { name = "torchaudio", specifier = ">=2.11.1", index = "https://download.pytorch.org/whl/cu132" },
     { name = "torchvision", specifier = ">=0.29.1", index = "https://download.pytorch.org/whl/cu132" },
+    { name = "tqdm", specifier = ">=4.67.3" },
     { name = "whisperx", specifier = ">=3.7.2" },
 ]
 
