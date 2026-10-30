@@ -9,21 +9,21 @@ dependencies = [
     "setuptools-rust>=1.12.1",
     "spacy>=3.8,<3.9",
     "srt>=3.5.3",
-    "torch==2.11.0",
-    "torchaudio==2.11.0",
-    "torchvision==0.26.0",
+    "torch>=2.15.0",
+    "torchaudio>=2.11.1",
+    "torchvision>=0.29.1",
     "whisperx>=3.7.2",
 ]
 
 [tool.uv.sources]
 en-core-web-lg = { url = "https://github.com/explosion/spacy-models/releases/download/en_core_web_lg-3.8.0/en_core_web_lg-3.8.0-py3-none-any.whl" }
-torch = { index = "pytorch-cu128" }
-torchaudio = { index = "pytorch-cu128" }
-torchvision = { index = "pytorch-cu128" }
+torch = { index = "pytorch-cu132" }
+torchaudio = { index = "pytorch-cu132" }
+torchvision = { index = "pytorch-cu132" }
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
 explicit = true
 
 [dependency-groups]
