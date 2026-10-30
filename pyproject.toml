@@ -5,6 +5,7 @@ requires-python = ">=3.12"
 dependencies = [
     "deepmultilingualpunctuation>=1.0.1",
     "en-core-web-lg",
+    "nvidia-cublas-cu12>=12.9.2.10 ; sys_platform == 'win32'",
     "openai-whisper>=20250625",
     "setuptools-rust>=1.12.1",
     "spacy>=3.8,<3.9",

@@ -5,6 +5,7 @@ import bisect
 import difflib
 import gc
 import re
+import sys
 import unicodedata
 from dataclasses import dataclass, replace
 from datetime import timedelta
@@ -14,13 +15,37 @@ from typing import Any
 import spacy
 import srt
 import torch
-import whisperx
+
+
+def _preload_cuda12_cublas() -> None:
+    """Load cuBLAS 12 for ctranslate2 (faster-whisper), which is built against CUDA 12
+    while torch ships CUDA 13 DLLs. Preloading by full path lets its by-name load succeed."""
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    try:
+        import nvidia.cublas
+    except ImportError:
+        return
+    bin_dir = Path(nvidia.cublas.__path__[0]) / "bin"
+    for name in ("cublasLt64_12.dll", "cublas64_12.dll"):
+        dll = bin_dir / name
+        if dll.exists():
+            ctypes.CDLL(str(dll))
+
+
+_preload_cuda12_cublas()
+
+import whisperx  # noqa: E402
 
 
 DEFAULT_INPUT = Path("audio.wav")
 LANGUAGE = "en"
 SPACY_MODEL = "en_core_web_lg"
 DEFAULT_PUNCTUATION_MODEL = "oliverguhr/fullstop-punctuation-multilang-large"
+# GPUs below this much VRAM get int8 weights and smaller batches so large-v3 fits (e.g. 4 GB laptops).
+LOW_VRAM_GIB = 6.0
 
 # Labels the restoration model emits; only these signal a sentence boundary.
 SENTENCE_END_PUNCT = {".", "?", "!"}
@@ -119,13 +144,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--compute-type",
         default="auto",
-        help="Whisper compute type. Defaults to float16 on CUDA and int8 on CPU.",
+        help=(
+            "Whisper compute type. Defaults to float16 on CUDA (int8_float16 on GPUs "
+            f"under {LOW_VRAM_GIB:g} GB VRAM) and int8 on CPU."
+        ),
     )
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=16,
-        help="WhisperX transcription batch size.",
+        default=None,
+        help=f"WhisperX transcription batch size. Defaults to 16, or 4 on GPUs under {LOW_VRAM_GIB:g} GB VRAM.",
     )
     parser.add_argument(
         "--threads",
@@ -244,10 +272,25 @@ def resolve_device(requested: str) -> str:
     return requested
 
 
-def resolve_compute_type(requested: str, device: str) -> str:
+def is_low_vram(device: str, device_index: int) -> bool:
+    if device != "cuda":
+        return False
+    total = torch.cuda.get_device_properties(device_index).total_memory
+    return total / 1024**3 < LOW_VRAM_GIB
+
+
+def resolve_compute_type(requested: str, device: str, low_vram: bool) -> str:
     if requested != "auto":
         return requested
-    return "float16" if device == "cuda" else "int8"
+    if device != "cuda":
+        return "int8"
+    return "int8_float16" if low_vram else "float16"
+
+
+def resolve_batch_size(requested: int | None, low_vram: bool) -> int:
+    if requested is not None:
+        return requested
+    return 4 if low_vram else 16
 
 
 def normalize_text(text: str) -> str:
@@ -272,7 +315,9 @@ def run_whisperx(args: argparse.Namespace, audio_path: Path) -> dict[str, Any]:
     patch_legacy_torchaudio_for_pyannote_import()
 
     device = resolve_device(args.device)
-    compute_type = resolve_compute_type(args.compute_type, device)
+    low_vram = is_low_vram(device, args.device_index)
+    compute_type = resolve_compute_type(args.compute_type, device, low_vram)
+    batch_size = resolve_batch_size(args.batch_size, low_vram)
     model_dir = str(args.model_dir) if args.model_dir else None
 
     if args.threads > 0:
@@ -298,7 +343,7 @@ def run_whisperx(args: argparse.Namespace, audio_path: Path) -> dict[str, Any]:
 
     result = model.transcribe(
         audio,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         chunk_size=args.chunk_size,
         print_progress=args.print_progress,
         verbose=args.verbose,
