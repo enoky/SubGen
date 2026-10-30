@@ -58,6 +58,8 @@ LOW_VRAM_GIB = 6.0
 # Segments aligned per whisperx.align call; small enough for a smooth progress bar.
 ALIGN_CHUNK_SEGMENTS = 25
 _START_TIME = time.monotonic()
+# Closing quotes/brackets at the very start of a sentence, followed by whitespace or the end.
+_LEADING_CLOSER_RE = re.compile(r"\s*([\"'”’»)\]]+)(?=\s|$)")
 
 # Labels the restoration model emits; only these signal a sentence boundary.
 SENTENCE_END_PUNCT = {".", "?", "!"}
@@ -621,16 +623,37 @@ def segment_sentences(
 ) -> list[tuple[str, list[TimedWord]]]:
     """Split a transcript into sentences, pairing each with its timed words. The
     word char offsets must already be consistent with `transcript`."""
-    nlp.max_length = max(nlp.max_length, len(transcript) + 1)
     out: list[tuple[str, list[TimedWord]]] = []
-    for sentence in nlp(transcript).sents:
-        text = normalize_text(sentence.text)
+    for start_char, end_char in sentence_char_spans(nlp, transcript):
+        text = normalize_text(transcript[start_char:end_char])
         if not text:
             continue
-        span = words_for_span(words, sentence.start_char, sentence.end_char)
+        span = words_for_span(words, start_char, end_char)
         if span:
             out.append((text, span))
     return out
+
+
+def sentence_char_spans(nlp: spacy.Language, text: str) -> list[tuple[int, int]]:
+    """Sentence boundaries as (start_char, end_char) spans.
+
+    spaCy ends a sentence at the period inside a quotation and hands the closing
+    quote to the next sentence (`... bestowed.` / `" He also ...`). A sentence
+    that opens with closing punctuation followed by whitespace gives it back to
+    the previous sentence; an opening quote (`"To the ...`) is left alone."""
+    nlp.max_length = max(nlp.max_length, len(text) + 1)
+    spans: list[tuple[int, int]] = []
+    for sentence in nlp(text).sents:
+        start, end = sentence.start_char, sentence.end_char
+        if spans:
+            match = _LEADING_CLOSER_RE.match(text, start, end)
+            if match:
+                prev_start, _ = spans[-1]
+                spans[-1] = (prev_start, match.end(1))
+                start = match.end()
+        if start < end:
+            spans.append((start, end))
+    return spans
 
 
 def cue_duration(words: list[TimedWord]) -> float | None:
@@ -792,15 +815,14 @@ def script_sentence_token_ranges(
 ) -> list[tuple[str, int, int]]:
     """Segment the script into sentences and express each as a half-open span of
     script-token indices, so aligned transcript positions can be tested against it."""
-    nlp.max_length = max(nlp.max_length, len(script_text) + 1)
     token_starts = [token.start for token in script_tokens]
     ranges: list[tuple[str, int, int]] = []
-    for sentence in nlp(script_text).sents:
-        text = normalize_text(sentence.text)
+    for start_char, end_char in sentence_char_spans(nlp, script_text):
+        text = normalize_text(script_text[start_char:end_char])
         if not text:
             continue
-        lo = bisect.bisect_left(token_starts, sentence.start_char)
-        hi = bisect.bisect_left(token_starts, sentence.end_char)
+        lo = bisect.bisect_left(token_starts, start_char)
+        hi = bisect.bisect_left(token_starts, end_char)
         if hi > lo:
             ranges.append((text, lo, hi))
     return ranges
