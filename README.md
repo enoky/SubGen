@@ -71,6 +71,22 @@ uv run python -m subgen path\to\audio.wav --model-dir .\models --local-files-onl
 By default, the output file is written next to the input file using the same stem
 and an `.srt` extension.
 
+## Web Interface
+
+Launch a Gradio web UI to upload audio (or video), optionally add the original
+script, and download the generated `.srt`:
+
+```powershell
+uv run python subgen_gradio.py
+```
+
+Add `--share` for a public `gradio.live` link.
+
+### Google Colab
+
+Open `SubGen_Colab.ipynb` in Colab, switch the runtime to a GPU, and run the
+cells. The last cell prints a public link to the web UI.
+
 ## CLI Options
 
 ```text

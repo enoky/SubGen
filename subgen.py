@@ -111,7 +111,11 @@ class Token:
     end: int
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Create a sentence-level SRT subtitle file from English speech using WhisperX."
     )
@@ -279,7 +283,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print WhisperX segment transcripts while processing.",
     )
-    return parser.parse_args()
+    return parser
 
 
 def resolve_device(requested: str) -> str:
