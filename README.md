@@ -71,10 +71,31 @@ uv run python -m subgen path\to\audio.wav --model-dir .\models --local-files-onl
 By default, the output file is written next to the input file using the same stem
 and an `.srt` extension.
 
+### MP4 export
+
+Add `--mp4` to also render a 1920x1080, 24 fps bluescreen video of the subtitles
+(white Yatra One text with a drop shadow on chroma blue `#0047BB`) muxed with the
+input's audio. It is written next to the `.srt` unless you pass `--mp4-output`:
+
+```powershell
+uv run python -m subgen path	oudio.wav --mp4
+```
+
+Encoding uses NVENC when available and falls back to `libx264`; force one with
+`--mp4-encoder`. To re-render a video from an existing (e.g. hand-edited) `.srt`
+without transcribing again:
+
+```powershell
+uv run python -m srt2mp4 subtitles.srt narration.wav out.mp4
+```
+
+The font is bundled in `fonts/`, so the output looks the same locally and on Colab.
+
 ## Web Interface
 
 Launch a Gradio web UI to upload audio (or video), optionally add the original
-script, and download the generated `.srt`:
+script, and download the generated `.srt` (tick **Also export MP4** for the
+subtitle video too):
 
 ```powershell
 uv run python subgen_gradio.py
@@ -105,6 +126,9 @@ input                     Audio file to transcribe. Defaults to audio.wav.
 --vad-onset               VAD onset threshold. Defaults to 0.5.
 --vad-offset              VAD offset threshold. Defaults to 0.363.
 --print-progress          Print WhisperX progress.
+--mp4                     Also render a bluescreen subtitle video with the input's audio.
+--mp4-output              MP4 output path (implies --mp4). Defaults to <srt stem>.mp4.
+--mp4-encoder             auto, h264_nvenc, hevc_nvenc, or libx264. Defaults to auto.
 --verbose                 Print WhisperX segment transcripts while processing.
 ```
 

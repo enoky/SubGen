@@ -279,6 +279,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.set_defaults(progress=True)
     parser.add_argument(
+        "--mp4",
+        action="store_true",
+        help=(
+            "Also render a 1920x1080 bluescreen video of the subtitles (Yatra One, "
+            "white with drop shadow) muxed with the input's audio."
+        ),
+    )
+    parser.add_argument(
+        "--mp4-output",
+        type=Path,
+        help="MP4 output path (implies --mp4). Defaults to the SRT path with an .mp4 extension.",
+    )
+    parser.add_argument(
+        "--mp4-encoder",
+        choices=("auto", "h264_nvenc", "hevc_nvenc", "libx264"),
+        default="auto",
+        help="Video encoder for --mp4. auto tries h264_nvenc, then falls back to libx264.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Print WhisperX segment transcripts while processing.",
@@ -1052,8 +1071,18 @@ def main() -> int:
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     write_srt(cues, output_path)
-    stage(args, "Done")
     print(f"Wrote {len(cues)} sentence-level subtitles to {output_path}")
+
+    if args.mp4 or args.mp4_output:
+        import srt2mp4
+
+        free_torch_memory()
+        mp4_path = args.mp4_output or output_path.with_suffix(".mp4")
+        stage(args, f"Rendering subtitle video: {mp4_path}")
+        srt2mp4.render_video(srt2mp4.parse_srt(output_path), audio_path, mp4_path, encoder=args.mp4_encoder)
+        print(f"Wrote subtitle video to {mp4_path}")
+
+    stage(args, "Done")
     return 0
 
 

@@ -12,6 +12,7 @@ from pathlib import Path
 
 import gradio as gr
 
+import srt2mp4
 import subgen
 
 WHISPER_MODELS = ["large-v3", "large-v3-turbo", "large-v2", "medium.en", "small.en", "base.en", "tiny.en"]
@@ -29,8 +30,9 @@ def generate(
     restore_punctuation: bool,
     repair_oversplits: bool,
     model_dir: str,
+    export_mp4: bool,
     progress: gr.Progress = gr.Progress(track_tqdm=True),
-) -> tuple[str | None, str, str]:
+) -> tuple[str | None, str | None, str, str]:
     if not audio_file:
         raise gr.Error("Upload an audio or video file first.")
 
@@ -70,6 +72,10 @@ def generate(
                 raise RuntimeError("WhisperX did not produce any sentence-level subtitle cues.")
             subgen.write_srt(cues, output_path)
             print(f"Wrote {len(cues)} sentence-level subtitles to {output_path.name}")
+            if export_mp4:
+                subgen.free_torch_memory()
+                mp4_path = srt2mp4.render_video(srt2mp4.parse_srt(output_path), audio_path, output_path.with_suffix(".mp4"))
+                print(f"Wrote subtitle video to {mp4_path.name}")
     except Exception as error:
         traceback.print_exc(file=log)
         print(log.getvalue(), file=sys.stderr)
@@ -77,7 +83,8 @@ def generate(
     finally:
         subgen.free_torch_memory()
 
-    return str(output_path), output_path.read_text(encoding="utf-8"), log.getvalue()
+    mp4_file = str(output_path.with_suffix(".mp4")) if export_mp4 else None
+    return str(output_path), mp4_file, output_path.read_text(encoding="utf-8"), log.getvalue()
 
 
 def build_app() -> gr.Blocks:
@@ -112,9 +119,14 @@ def build_app() -> gr.Blocks:
                         label="Model cache directory (optional)",
                         placeholder="e.g. /content/drive/MyDrive/subgen-models",
                     )
+                export_mp4 = gr.Checkbox(
+                    value=False,
+                    label="Also export MP4 (1080p bluescreen subtitle video with the input's audio)",
+                )
                 run = gr.Button("Generate subtitles", variant="primary")
             with gr.Column():
                 srt_file = gr.File(label="Subtitles (.srt)")
+                mp4_file = gr.File(label="Subtitle video (.mp4)")
                 preview = gr.Textbox(label="Preview", lines=16)
                 log = gr.Textbox(label="Log", lines=6)
 
@@ -132,8 +144,9 @@ def build_app() -> gr.Blocks:
                 restore_punctuation,
                 repair_oversplits,
                 model_dir,
+                export_mp4,
             ],
-            outputs=[srt_file, preview, log],
+            outputs=[srt_file, mp4_file, preview, log],
         )
     return app
 
