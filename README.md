@@ -108,6 +108,30 @@ Add `--share` for a public `gradio.live` link.
 Open `SubGen_Colab.ipynb` in Colab, switch the runtime to a GPU, and run the
 cells. The last cell prints a public link to the web UI.
 
+### Google Cloud Run
+
+The `Dockerfile` packages the web UI for Cloud Run on an NVIDIA L4 GPU, with
+the Whisper, alignment, VAD, punctuation and spaCy models baked into the image
+so cold starts don't download them. With `gcloud` signed in to your project,
+run from the repo root:
+
+```bash
+bash cloudrun/deploy.sh
+```
+
+It builds the image with Cloud Build, then deploys a private service in
+`us-east4` (8 CPU, 32 GiB, 1 L4, scale to zero, max 1 instance, 60-minute
+request timeout). Override `REGION`, `SERVICE` or `WHISPER_MODELS` as
+environment variables, e.g. `WHISPER_MODELS="large-v3 large-v3-turbo"`. Open
+the private service through an authenticated tunnel:
+
+```bash
+gcloud run services proxy subgen --region us-east4 --port 8080
+```
+
+GPU instances are billed for as long as they run, so keep `--min-instances 0`
+unless you need the app always warm.
+
 ## CLI Options
 
 ```text
