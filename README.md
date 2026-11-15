@@ -140,7 +140,20 @@ run the setup cells. Then either:
   video. Any other options are passed to subgen (e.g. `--model large-v3-turbo`).
 - **Web UI:** the last cell prints a public link to the Gradio app.
 
+Before transcription, the narration is loudness-normalized for YouTube: two-pass
+EBU R128 to -14 LUFS integrated and -1.5 dBTP true peak, saved as 48 kHz 24-bit WAV.
+The normalized audio is what gets transcribed and put in the video, and it is also
+saved to `output/narration_norm.wav`. Change the target with `--lufs` / `--true-peak`,
+or skip this step with `--no-normalize`.
+
 The same pipeline runs anywhere with `uv run python -m drive_pipeline --root DIR`.
+
+### Loudness normalization on its own
+
+```powershell
+uv run python -m normalize_audio narration.wav            # writes narration_norm.wav
+uv run python -m normalize_audio *.wav --lufs -16
+```
 
 ### Google Cloud Run
 
