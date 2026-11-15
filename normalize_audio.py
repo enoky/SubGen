@@ -20,10 +20,10 @@ import json
 import re
 import shutil
 import subprocess
-import sys
-import threading
 import time
 from pathlib import Path
+
+from ffmpeg_progress import run_ffmpeg as run_ffmpeg_with_bar
 
 TARGET_I = -14.0  # integrated loudness (LUFS)
 TARGET_TP = -1.5  # true peak ceiling (dBTP)
@@ -31,8 +31,6 @@ TARGET_LRA = 11.0  # loudness range (LU)
 SAMPLE_RATE = 48000
 CODEC = "pcm_s24le"
 SUFFIX = "_norm"
-
-IS_TTY = sys.stdout.isatty()
 
 
 def log(msg: str = "") -> None:
@@ -66,46 +64,14 @@ def probe_audio(src: Path) -> tuple[float | None, int | None]:
 
 
 def run_ffmpeg(args: list[str], label: str, duration: float | None) -> str:
-    """Run ffmpeg with a live progress line; return its stderr (where loudnorm prints JSON)."""
-    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-nostats", "-progress", "pipe:1", *args]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
-    # Drain stderr in the background so ffmpeg never blocks on a full pipe.
-    stderr_chunks: list[str] = []
-    reader = threading.Thread(target=lambda: stderr_chunks.append(proc.stderr.read()), daemon=True)
-    reader.start()
-
+    """Run ffmpeg with a progress bar; return its stderr (where loudnorm prints JSON)."""
     start = time.time()
-    last_pct = -1
-    for line in proc.stdout:
-        key, _, value = line.strip().partition("=")
-        if key not in ("out_time_us", "out_time_ms") or not value.isdigit():
-            continue
-        pos = int(value) / 1_000_000
-        elapsed = time.time() - start
-        if duration:
-            pct = min(100, int(pos / duration * 100))
-            if pct == last_pct:
-                continue
-            last_pct = pct
-            eta = (elapsed / pos * (duration - pos)) if pos > 0 else 0
-            status = f"{pct:3d}%  {fmt_time(pos)}/{fmt_time(duration)}  ETA {fmt_time(eta)}"
-        else:
-            status = f"{fmt_time(pos)} processed"
-        if IS_TTY:
-            print(f"\r    {label}: {status}   ", end="", flush=True)
-
-    proc.wait()
-    reader.join()
-    stderr = "".join(stderr_chunks)
-    elapsed = time.time() - start
-
-    if IS_TTY:
-        print("\r" + " " * 70 + "\r", end="")  # clear progress line
-    if proc.returncode != 0:
+    try:
+        stderr = run_ffmpeg_with_bar(["ffmpeg", "-hide_banner", *args], duration, f"    {label}")
+    except subprocess.CalledProcessError as e:
         log(f"    {label}: FAILED")
-        raise RuntimeError(f"ffmpeg failed:\n{stderr[-2000:]}")
-    log(f"    {label}: done in {elapsed:.1f}s")
+        raise RuntimeError(f"ffmpeg failed:\n{(e.stderr or '')[-2000:]}") from e
+    log(f"    {label}: done in {time.time() - start:.1f}s")
     return stderr
 
 
