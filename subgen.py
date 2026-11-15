@@ -295,7 +295,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--mp4-encoder",
         choices=("auto", "h264_nvenc", "hevc_nvenc", "libx264"),
         default="auto",
-        help="Video encoder for --mp4. auto tries h264_nvenc, then falls back to libx264.",
+        help=(
+            "Video encoder for --mp4. auto tries h264_nvenc, then libx264; with "
+            "--background-clips it tries hevc_nvenc, h264_nvenc, then libx264."
+        ),
+    )
+    parser.add_argument(
+        "--background-clips",
+        type=Path,
+        help=(
+            "Directory of .mp4 clips (implies --mp4). They are joined in filename order, "
+            "cropped and scaled to 1920x1080, and used as the video background instead of "
+            "chroma blue. Their audio is dropped."
+        ),
     )
     parser.add_argument(
         "--verbose",
@@ -1051,8 +1063,8 @@ def seconds_to_timedelta(seconds: float) -> timedelta:
     return timedelta(milliseconds=round(max(seconds, 0.0) * 1000))
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     audio_path = args.input
     output_path = args.output or Path("./project/autogen-subs.srt")
 
@@ -1073,13 +1085,19 @@ def main() -> int:
     write_srt(cues, output_path)
     print(f"Wrote {len(cues)} sentence-level subtitles to {output_path}")
 
-    if args.mp4 or args.mp4_output:
+    if args.mp4 or args.mp4_output or args.background_clips:
         import srt2mp4
 
         free_torch_memory()
         mp4_path = args.mp4_output or output_path.with_suffix(".mp4")
         stage(args, f"Rendering subtitle video: {mp4_path}")
-        srt2mp4.render_video(srt2mp4.parse_srt(output_path), audio_path, mp4_path, encoder=args.mp4_encoder)
+        srt2mp4.render_video(
+            srt2mp4.parse_srt(output_path),
+            audio_path,
+            mp4_path,
+            encoder=args.mp4_encoder,
+            background_clips=args.background_clips,
+        )
         print(f"Wrote subtitle video to {mp4_path}")
 
     stage(args, "Done")
