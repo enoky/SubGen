@@ -39,6 +39,8 @@ import srt
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 from tqdm import tqdm
 
+from ffmpeg_progress import run_ffmpeg
+
 FONT_PATH = Path(__file__).resolve().parent / "fonts" / "YatraOne-Regular.ttf"
 ENCODERS = ("auto", "h264_nvenc", "hevc_nvenc", "libx264")
 NVENC_ENCODERS = ("hevc_nvenc", "h264_nvenc")
@@ -579,7 +581,7 @@ def render_clip_video(
             print(f"Encoding MP4 with {enc} ({label})", flush=True)
             cmd = build_clip_command(plan, mode, enc, clips_list, cards_list, audio_path, output_path, caps)
             try:
-                subprocess.run(cmd, check=True)
+                run_ffmpeg(cmd, plan.duration, f"Encoding ({enc})")
                 break
             except subprocess.CalledProcessError:
                 if n == len(attempts):
@@ -636,7 +638,7 @@ def render_video(
                 "-c:a", "aac", "-b:a", "192k", "-t", f"{end_frame / fps:.6f}",
                 "-movflags", "+faststart", str(output_path),
             ]
-            subprocess.run(cmd, check=True)
+            run_ffmpeg(cmd, end_frame / fps, f"Encoding ({enc})")
 
         if encoder == "auto":
             # NVENC is much faster but needs an NVIDIA GPU and an ffmpeg built with it.
