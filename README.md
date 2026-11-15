@@ -91,6 +91,31 @@ uv run python -m srt2mp4 subtitles.srt narration.wav out.mp4
 
 The font is bundled in `fonts/`, so the output looks the same locally and on Colab.
 
+### Video clips as the background
+
+Pass a folder of `.mp4` clips to use them instead of the blue background:
+
+```powershell
+uv run python -m subgen path\to\audio.wav --background-clips path\to\clips
+uv run python -m srt2mp4 subtitles.srt narration.wav out.mp4 --clips path\to\clips
+```
+
+- The clips are joined in natural filename order (`clip2` before `clip10`), then
+  center-cropped to 16:9 and scaled to 1920x1080 with Lanczos. For example,
+  1280x704 is cropped by 14 px on each side, then scaled. Their audio is dropped.
+- The output uses the first clip's frame rate. If the clips are shorter than the
+  narration, the last frame is held; if longer, they are cut to the narration's length.
+- The text gets a black outline as well as the shadow, so it stays readable on footage.
+- The encoding is tuned for YouTube 1080p uploads: HEVC (NVENC) quality-targeted VBR
+  averaging around 10 Mbps, a keyframe every 2 seconds, BT.709 tags, AAC-LC 48 kHz
+  stereo at 384 kbps, and `+faststart`.
+- On an NVIDIA GPU the whole chain runs on the GPU: NVDEC decode and crop,
+  `scale_cuda`, `overlay_cuda`, NVENC. If that isn't possible, it falls back to GPU
+  decode and encode with CPU filters, then to libx264 on the CPU. Clips with
+  different sizes or frame rates, or clips that need the last frame held, use the
+  GPU-decode/CPU-filter path. Run `uv run python -m srt2mp4 --check` to see what
+  your ffmpeg supports.
+
 ## Web Interface
 
 Launch a Gradio web UI to upload audio (or video), optionally add the original
@@ -105,8 +130,17 @@ Add `--share` for a public `gradio.live` link.
 
 ### Google Colab
 
-Open `SubGen_Colab.ipynb` in Colab, switch the runtime to a GPU, and run the
-cells. The last cell prints a public link to the web UI.
+Open `SubGen_Colab.ipynb` in Colab, switch the runtime to an L4 (or any) GPU, and
+run the setup cells. Then either:
+
+- **Drive pipeline:** put `narration.wav`, `clips/*.mp4` and (optionally)
+  `script.txt` in `MyDrive/subgen/`, then run the Drive cells. `narration.srt` and
+  `narration.mp4` are saved to `MyDrive/subgen/output/`. Add `--reuse-srt` to
+  re-render the video from an SRT you edited on Drive, or `--srt-only` to skip the
+  video. Any other options are passed to subgen (e.g. `--model large-v3-turbo`).
+- **Web UI:** the last cell prints a public link to the Gradio app.
+
+The same pipeline runs anywhere with `uv run python -m drive_pipeline --root DIR`.
 
 ### Google Cloud Run
 
@@ -153,6 +187,7 @@ input                     Audio file to transcribe. Defaults to audio.wav.
 --mp4                     Also render a bluescreen subtitle video with the input's audio.
 --mp4-output              MP4 output path (implies --mp4). Defaults to <srt stem>.mp4.
 --mp4-encoder             auto, h264_nvenc, hevc_nvenc, or libx264. Defaults to auto.
+--background-clips        Folder of .mp4 clips to use as the video background (implies --mp4).
 --verbose                 Print WhisperX segment transcripts while processing.
 ```
 
