@@ -43,12 +43,17 @@ def test_crop_box(size, box):
     assert s.crop_box(*size) == box
 
 
-def test_plan_pads_only_beyond_one_frame():
+def test_hold_only_beyond_one_frame():
     clips = [clip(dur=10.0), clip("clip2.mp4", dur=10.0)]
-    assert s.plan_clips(clips, 20.03).pad_seconds == 0.0
-    assert s.plan_clips(clips, 21.0).pad_seconds == pytest.approx(1.0)
-    assert s.plan_clips(clips, 19.0).pad_seconds == 0.0  # longer clips are just cut
+    assert s.hold_seconds(clips, 20.03) == 0.0
+    assert s.hold_seconds(clips, 21.0) == pytest.approx(1.0)
+    assert s.hold_seconds(clips, 19.0) == 0.0  # longer clips are just cut
     assert s.plan_clips(clips, 19.0).end_frame == 19 * 24
+
+
+def test_majority_signature_ignores_odd_clip():
+    clips = [clip("b.mp4", w=1920, h=1080), clip(), clip("c.mp4")]
+    assert s.majority_signature(clips) == ("h264", 1280, 704, Fraction(24), "yuv420p")
 
 
 def test_attempt_order_on_gpu():
@@ -58,14 +63,6 @@ def test_attempt_order_on_gpu():
         ("hybrid", "hevc_nvenc"), ("hybrid", "h264_nvenc"),
         ("cpu", "libx264"),
     ]
-
-
-def test_attempts_skip_full_gpu_when_padding_or_mixed():
-    padded = s.plan_clips([clip()], 15.0)
-    assert ("gpu", "hevc_nvenc") not in s.clip_attempts(padded, "auto", GPU_CAPS)
-    mixed = s.plan_clips([clip(), clip("b.mp4", w=1920, h=1080)], 20.0)
-    assert not mixed.uniform
-    assert s.clip_attempts(mixed, "auto", GPU_CAPS)[0] == ("hybrid", "hevc_nvenc")
 
 
 def test_attempts_without_gpu():
@@ -87,30 +84,43 @@ def test_gpu_command():
     assert cmd[cmd.index("-map") + 3] == "2:a:0"  # narration audio, never the clips'
     assert "-tag:v hvc1" in joined and "-movflags +faststart" in joined
     assert "-g 48" in joined and "-b:a 384k" in joined and "-ar 48000" in joined
+    assert joined.count("-i ") == 3  # clips list, cards list, narration: never one input per clip
 
 
-def test_gpu_command_rejects_padding():
+def test_command_rejects_mixed_clips():
     with pytest.raises(ValueError):
-        build(s.plan_clips([clip()], 15.0), "gpu")
+        build(s.plan_clips([clip(), clip("b.mp4", w=1920, h=1080)], 15.0), "gpu")
 
 
-def test_hybrid_command_pads_and_crops():
+def test_hybrid_command_crops():
     cmd = build(s.plan_clips([clip()], 12.0), "hybrid")
     graph = cmd[cmd.index("-filter_complex") + 1]
-    assert cmd[cmd.index("-i") - 2:cmd.index("-i")] == ["-safe", "0"]
     assert "-hwaccel" in cmd
     assert "crop=1252:704:14:0,scale=1920:1080:flags=lanczos" in graph
-    assert "tpad=stop_mode=clone:stop_duration=2.000000" in graph
 
 
-def test_mixed_clips_use_concat_filter():
-    plan = s.plan_clips([clip(), clip("b.mp4", w=1920, h=1080, fps=30, dur=5)], 15.0)
-    cmd = build(plan, "cpu", "libx264")
-    graph = cmd[cmd.index("-filter_complex") + 1]
-    assert "-hwaccel" not in cmd
-    assert "concat=n=2:v=1:a=0" in graph and "[2:v]format=rgba" in graph
-    assert cmd[cmd.index("-map") + 3] == "3:a:0"
-    assert "fps=24" in graph  # first clip's frame rate wins
+def test_cpu_command_has_no_hwaccel():
+    cmd = build(s.plan_clips([clip()], 12.0), "cpu", "libx264")
+    assert "-hwaccel" not in cmd and "libx264" in cmd
+
+
+def test_probe_cache_roundtrip(tmp_path, monkeypatch):
+    files = []
+    for i in range(3):
+        f = tmp_path / f"clip{i}.mp4"
+        f.write_bytes(b"x" * (i + 1))
+        files.append(f)
+    calls = []
+    monkeypatch.setattr(s, "probe_clip", lambda p: calls.append(p) or clip(str(p), dur=1.5))
+    cache = tmp_path / "cache.json"
+    first = s.probe_clips(files, cache)
+    assert len(calls) == 3 and cache.is_file()
+    second = s.probe_clips(files, cache)
+    assert len(calls) == 3  # served from the cache
+    assert second == first and [c.path for c in second] == files
+    files[1].write_bytes(b"changed")
+    s.probe_clips(files, cache)
+    assert calls[-1] == files[1] and len(calls) == 4  # only the changed file is probed again
 
 
 def test_transparent_card_has_outline():

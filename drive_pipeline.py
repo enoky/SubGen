@@ -10,8 +10,12 @@ Expected layout under ``--root`` (Colab: /content/drive/MyDrive/subgen):
 The narration is first loudness-normalized for YouTube (-14 LUFS, -1.5 dBTP,
 48 kHz); the normalized audio is what gets transcribed and put in the video.
 
-Inputs are copied to local disk first and outputs are written locally, then copied
-to Drive, because reading and writing through the Drive mount is slow.
+The clips are read straight from Drive while the video encodes, so reading
+overlaps with GPU work instead of waiting for a full copy first. --copy-clips
+copies them to local disk first instead (in parallel; clips already copied
+earlier in the session are skipped). Clip details are cached in
+output/.clip_info_cache.json, so reruns over the same clips start right away.
+The narration and outputs go through local disk, then outputs are copied to Drive.
 
 Usage (Colab, after mounting Drive):
     !python -m drive_pipeline
@@ -20,15 +24,19 @@ Usage (Colab, after mounting Drive):
     !python -m drive_pipeline --reuse-srt                # re-render output/narration.srt (e.g. after editing it)
     !python -m drive_pipeline --lufs -16                 # different loudness target
     !python -m drive_pipeline --no-normalize             # use narration.wav as is
+    !python -m drive_pipeline --copy-clips               # copy clips locally before encoding
 """
 
 from __future__ import annotations
 
 import argparse
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 import tempfile
 import time
 from pathlib import Path
+
+from tqdm import tqdm
 
 import normalize_audio
 import srt2mp4
@@ -43,6 +51,33 @@ def copy_in(src: Path, dst_dir: Path) -> Path:
     return dst
 
 
+def copy_clips(srcs: list[Path], dst_dir: Path, workers: int = 8) -> list[Path]:
+    """Copy clips to ``dst_dir`` in parallel, keeping names and modification times.
+    Files already there with the same size and time are skipped; others are removed."""
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    wanted = {s.name for s in srcs}
+    for stale in dst_dir.iterdir():
+        if stale.name not in wanted:
+            stale.unlink()
+
+    def copy(src: Path) -> int:
+        dst = dst_dir / src.name
+        st = src.stat()
+        if dst.exists():
+            dt = dst.stat()
+            if dt.st_size == st.st_size and dt.st_mtime_ns == st.st_mtime_ns:
+                return st.st_size
+        shutil.copy2(src, dst)
+        return st.st_size
+
+    total = sum(s.stat().st_size for s in srcs)
+    with ThreadPoolExecutor(max_workers=workers) as pool, \
+            tqdm(total=total, desc="Copying clips", unit="B", unit_scale=True, unit_divisor=1024) as bar:
+        for size in pool.map(copy, srcs):
+            bar.update(size)
+    return [dst_dir / s.name for s in srcs]
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", type=Path, default=DEFAULT_ROOT, help=f"Drive folder. Defaults to {DEFAULT_ROOT}.")
@@ -52,6 +87,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--output", default="output", help="Output folder name inside --root.")
     ap.add_argument("--work", type=Path, help="Local working directory. Defaults to /content/subgen-work on Colab.")
     ap.add_argument("--encoder", choices=srt2mp4.ENCODERS, default="auto", help="Video encoder (auto = best available).")
+    ap.add_argument(
+        "--copy-clips", action="store_true",
+        help="Copy clips to local disk (in parallel) before encoding instead of reading them from Drive.",
+    )
     ap.add_argument("--no-normalize", action="store_true", help="Skip loudness normalization of the narration.")
     ap.add_argument(
         "--lufs", type=float, default=normalize_audio.TARGET_I,
@@ -95,12 +134,14 @@ def main(argv: list[str] | None = None) -> int:
         tmp = tempfile.TemporaryDirectory()
         work = Path(tmp.name)
     if work.exists():
-        shutil.rmtree(work / "input", ignore_errors=True)
+        for name in ("narration", "script"):  # keep input/clips so --copy-clips can skip them next run
+            for old in (work / "input").glob(f"{name}*"):
+                old.unlink()
     local_out = work / "output"
     local_out.mkdir(parents=True, exist_ok=True)
 
     try:
-        print(f"Copying inputs from {root} to {work}", flush=True)
+        print(f"Copying narration from {root} to {work}", flush=True)
         audio = copy_in(audio_src, work / "input")
         if not args.no_normalize:
             print(f"Normalizing narration to {args.lufs:g} LUFS, {args.true_peak:g} dBTP", flush=True)
@@ -109,7 +150,7 @@ def main(argv: list[str] | None = None) -> int:
             audio = normalized
             shutil.copyfile(audio, out_dir / audio.name)
             print(f"Saved {out_dir / audio.name}", flush=True)
-        clips = [copy_in(c, work / "input" / "clips") for c in clips_src]
+        clips = copy_clips(clips_src, work / "input" / "clips") if args.copy_clips and clips_src else clips_src
         srt_path = local_out / srt_name
         mp4_path = local_out / mp4_name
 
@@ -133,7 +174,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if not args.srt_only:
             srt2mp4.render_video(
-                srt2mp4.parse_srt(srt_path), audio, mp4_path, encoder=args.encoder, background_clips=clips
+                srt2mp4.parse_srt(srt_path), audio, mp4_path, encoder=args.encoder, background_clips=clips,
+                probe_cache=out_dir / ".clip_info_cache.json",
             )
             print(f"Copying video to {out_dir / mp4_name}", flush=True)
             shutil.copyfile(mp4_path, out_dir / mp4_name)

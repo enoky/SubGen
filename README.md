@@ -103,17 +103,18 @@ uv run python -m srt2mp4 subtitles.srt narration.wav out.mp4 --clips path\to\cli
 - The clips are joined in natural filename order (`clip2` before `clip10`), then
   center-cropped to 16:9 and scaled to 1920x1080 with Lanczos. For example,
   1280x704 is cropped by 14 px on each side, then scaled. Their audio is dropped.
-- The output uses the first clip's frame rate. If the clips are shorter than the
+- The output uses the clips' frame rate. If the clips are shorter than the
   narration, the last frame is held; if longer, they are cut to the narration's length.
+- Thousands of clips are fine: they are checked in parallel and read through a single
+  ffmpeg input. Any clip whose format differs from the rest (size, frame rate, codec)
+  is re-encoded to match first, so the join stays seamless and on the GPU.
 - The text gets a black outline as well as the shadow, so it stays readable on footage.
 - The encoding is tuned for YouTube 1080p uploads: HEVC (NVENC) quality-targeted VBR
   averaging around 10 Mbps, a keyframe every 2 seconds, BT.709 tags, AAC-LC 48 kHz
   stereo at 384 kbps, and `+faststart`.
 - On an NVIDIA GPU the whole chain runs on the GPU: NVDEC decode and crop,
   `scale_cuda`, `overlay_cuda`, NVENC. If that isn't possible, it falls back to GPU
-  decode and encode with CPU filters, then to libx264 on the CPU. Clips with
-  different sizes or frame rates, or clips that need the last frame held, use the
-  GPU-decode/CPU-filter path. Run `uv run python -m srt2mp4 --check` to see what
+  decode and encode with CPU filters, then to libx264 on the CPU. Run `uv run python -m srt2mp4 --check` to see what
   your ffmpeg supports.
 
 ## Web Interface
@@ -139,6 +140,12 @@ run the setup cells. Then either:
   re-render the video from an SRT you edited on Drive, or `--srt-only` to skip the
   video. Any other options are passed to subgen (e.g. `--model large-v3-turbo`).
 - **Web UI:** the last cell prints a public link to the Gradio app.
+
+Clips are read straight from Drive while the video encodes, rather than copied to
+the Colab machine first, so reading overlaps with GPU work. Clip details are cached in
+`output/.clip_info_cache.json`, so reruns over the same clips start right away. If
+streaming from Drive turns out slow, `--copy-clips` copies them to local disk first
+(in parallel; clips already copied earlier in the session are skipped).
 
 Before transcription, the narration is loudness-normalized for YouTube: two-pass
 EBU R128 to -14 LUFS integrated and -1.5 dBTP true peak, saved as 48 kHz 24-bit WAV.
