@@ -5,7 +5,10 @@ Expected layout under ``--root`` (Colab: /content/drive/MyDrive/subgen):
     narration.wav       narration audio (required)
     clips/*.mp4         background clips, joined in natural filename order (required)
     script.txt          original script, used for cue wording if present (optional)
-    output/             narration.srt and narration.mp4 are written here
+    output/             narration.srt, narration.mp4 and narration_norm.wav are written here
+
+The narration is first loudness-normalized for YouTube (-14 LUFS, -1.5 dBTP,
+48 kHz); the normalized audio is what gets transcribed and put in the video.
 
 Inputs are copied to local disk first and outputs are written locally, then copied
 to Drive, because reading and writing through the Drive mount is slow.
@@ -15,6 +18,8 @@ Usage (Colab, after mounting Drive):
     !python -m drive_pipeline --model large-v3-turbo     # extra options go to subgen
     !python -m drive_pipeline --srt-only                 # just the subtitles
     !python -m drive_pipeline --reuse-srt                # re-render output/narration.srt (e.g. after editing it)
+    !python -m drive_pipeline --lufs -16                 # different loudness target
+    !python -m drive_pipeline --no-normalize             # use narration.wav as is
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ import tempfile
 import time
 from pathlib import Path
 
+import normalize_audio
 import srt2mp4
 
 DEFAULT_ROOT = Path("/content/drive/MyDrive/subgen")
@@ -46,6 +52,15 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--output", default="output", help="Output folder name inside --root.")
     ap.add_argument("--work", type=Path, help="Local working directory. Defaults to /content/subgen-work on Colab.")
     ap.add_argument("--encoder", choices=srt2mp4.ENCODERS, default="auto", help="Video encoder (auto = best available).")
+    ap.add_argument("--no-normalize", action="store_true", help="Skip loudness normalization of the narration.")
+    ap.add_argument(
+        "--lufs", type=float, default=normalize_audio.TARGET_I,
+        help=f"Narration loudness target in LUFS (default {normalize_audio.TARGET_I:g}, YouTube's reference).",
+    )
+    ap.add_argument(
+        "--true-peak", type=float, default=normalize_audio.TARGET_TP,
+        help=f"Narration true-peak ceiling in dBTP (default {normalize_audio.TARGET_TP:g}).",
+    )
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--srt-only", action="store_true", help="Only write the SRT; skip the video.")
     mode.add_argument("--reuse-srt", action="store_true", help="Skip transcription and render the existing output SRT.")
@@ -87,6 +102,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         print(f"Copying inputs from {root} to {work}", flush=True)
         audio = copy_in(audio_src, work / "input")
+        if not args.no_normalize:
+            print(f"Normalizing narration to {args.lufs:g} LUFS, {args.true_peak:g} dBTP", flush=True)
+            normalized = audio.with_name(f"{audio.stem}{normalize_audio.SUFFIX}.wav")
+            normalize_audio.normalize(audio, normalized, args.lufs, args.true_peak)
+            audio = normalized
+            shutil.copyfile(audio, out_dir / audio.name)
+            print(f"Saved {out_dir / audio.name}", flush=True)
         clips = [copy_in(c, work / "input" / "clips") for c in clips_src]
         srt_path = local_out / srt_name
         mp4_path = local_out / mp4_name
