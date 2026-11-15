@@ -13,6 +13,9 @@ Two backgrounds are supported:
   top. The clips' own audio is dropped. On an NVIDIA GPU the whole chain runs on
   the GPU (NVDEC decode + crop, scale_cuda, overlay_cuda, NVENC); otherwise it
   falls back to GPU decode/encode with CPU filters, then to CPU only.
+  All clips are read through one concat demuxer input, so thousands of clips
+  are fine. Clips that differ from the majority format are re-encoded to match,
+  and a still of the last frame is appended if the clips run short.
 
 Usage:
     uv run python -m srt2mp4 subtitles.srt narration.wav out.mp4
@@ -24,11 +27,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
 import tempfile
+from collections import Counter
 from collections.abc import Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from fractions import Fraction
 from functools import lru_cache
@@ -176,19 +182,27 @@ def build_card_timeline(
         return round(t * fps_f)
 
     blank = work / "blank.png"
-    draw("").save(blank)
-
+    jobs = [(blank, "")]
     entries, cursor = [], 0
-    for i, cue in enumerate(tqdm(cues, desc="Rendering subtitle frames", unit="cue"), 1):
+    for i, cue in enumerate(cues, 1):
         f0, f1 = max(frame(cue.start), cursor), frame(cue.end)
         if f1 <= f0:
             continue
         if f0 > cursor:
             entries.append((blank, f0 - cursor))
         card = work / f"{i:05d}.png"
-        draw(cue.text).save(card)
+        jobs.append((card, cue.text))
         entries.append((card, f1 - f0))
         cursor = f1
+
+    # Drawing and PNG compression mostly release the GIL, so threads help. These
+    # files are temporary, so favor speed over size.
+    def save(job: tuple[Path, str]) -> None:
+        job_path, text = job
+        draw(text).save(job_path, compress_level=1)
+
+    with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as pool:
+        list(tqdm(pool.map(save, jobs), total=len(jobs), desc="Rendering subtitle frames", unit="cue"))
     end_frame = max(frame(total), cursor)
     if end_frame > cursor:
         entries.append((blank, end_frame - cursor))
@@ -268,6 +282,55 @@ def probe_clip(path: Path) -> ClipInfo:
         pix_fmt=s.get("pix_fmt", ""),
         duration=float(data["format"]["duration"]),
     )
+
+
+def _clip_to_dict(info: ClipInfo) -> dict:
+    return {"codec": info.codec, "width": info.width, "height": info.height,
+            "fps": str(info.fps), "pix_fmt": info.pix_fmt, "duration": info.duration}
+
+
+def _clip_from_dict(path: Path, d: dict) -> ClipInfo:
+    return ClipInfo(Path(path), d["codec"], int(d["width"]), int(d["height"]),
+                    Fraction(d["fps"]), d["pix_fmt"], float(d["duration"]))
+
+
+def probe_clips(paths: Sequence[Path], cache_path: Path | None = None, workers: int = 16) -> list[ClipInfo]:
+    """Probe many clips in parallel (network drives are slow per file but fine in
+    parallel). Results are cached in ``cache_path`` by file name, size and mtime,
+    so a rerun over the same clips is instant."""
+    cache: dict[str, dict] = {}
+    if cache_path and Path(cache_path).is_file():
+        try:
+            cache = json.loads(Path(cache_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            cache = {}
+
+    def key(p: Path) -> str:
+        st = p.stat()
+        return f"{p.name}|{st.st_size}|{st.st_mtime_ns}"
+
+    results: list[ClipInfo | None] = [None] * len(paths)
+    todo = []
+    for i, p in enumerate(paths):
+        k = key(Path(p))
+        if k in cache:
+            results[i] = _clip_from_dict(p, cache[k])
+        else:
+            todo.append((i, Path(p), k))
+
+    if todo:
+        with ThreadPoolExecutor(max_workers=workers) as pool, \
+                tqdm(total=len(todo), desc="Checking clips", unit="clip") as bar:
+            for (i, _, k), info in zip(todo, pool.map(lambda t: probe_clip(t[1]), todo)):
+                results[i] = info
+                cache[k] = _clip_to_dict(info)
+                bar.update()
+        if cache_path:
+            try:
+                Path(cache_path).write_text(json.dumps(cache), encoding="utf-8")
+            except OSError as e:
+                print(f"Could not save clip cache {cache_path}: {e}", flush=True)
+    return results  # type: ignore[return-value]
 
 
 def crop_box(width: int, height: int, out_w: int = 1920, out_h: int = 1080) -> tuple[int, int, int, int]:
@@ -423,7 +486,6 @@ class ClipPlan:
     clips: list[ClipInfo]
     fps: Fraction
     end_frame: int
-    pad_seconds: float  # how long to hold the last clip frame to reach the narration's end
     out_w: int = 1920
     out_h: int = 1080
 
@@ -438,11 +500,105 @@ class ClipPlan:
 
 def plan_clips(clips: Sequence[ClipInfo], narration_seconds: float, style: Style = VIDEO_STYLE) -> ClipPlan:
     fps = clips[0].fps
-    end_frame = round(narration_seconds * fps)
-    clip_total = sum(c.duration for c in clips)
-    gap = narration_seconds - clip_total
-    pad = gap if gap > 1 / float(fps) else 0.0
-    return ClipPlan(list(clips), fps, end_frame, pad, style.width, style.height)
+    return ClipPlan(list(clips), fps, round(narration_seconds * fps), style.width, style.height)
+
+
+def majority_signature(clips: Sequence[ClipInfo]) -> tuple[str, int, int, Fraction, str]:
+    return Counter(c.signature for c in clips).most_common(1)[0][0]
+
+
+def hold_seconds(clips: Sequence[ClipInfo], narration_seconds: float) -> float:
+    """How long to hold the last frame so the video reaches the narration's end (0 if
+    the clips are long enough, give or take a frame)."""
+    gap = narration_seconds - sum(c.duration for c in clips)
+    return gap if gap > 1 / float(clips[0].fps) else 0.0
+
+
+# Encoders that can write clips matching the majority's codec, fastest first.
+CONFORM_ENCODERS = {
+    "h264": ("h264_nvenc", "libx264"),
+    "hevc": ("hevc_nvenc", "libx265"),
+    "av1": ("av1_nvenc", "libsvtav1"),
+}
+
+
+def conform_encoders(codec: str, caps: Caps) -> list[str]:
+    names = [e for e in CONFORM_ENCODERS.get(codec, ()) if e in caps.encoders and (caps.gpu or "nvenc" not in e)]
+    if not names:
+        raise RuntimeError(f"Can't re-encode clips to {codec} to match the others; convert them to one format first.")
+    return names
+
+
+def conform_encoder_args(encoder: str) -> list[str]:
+    """Near-transparent settings for the few clips that are re-encoded to match."""
+    if "nvenc" in encoder:
+        return ["-c:v", encoder, "-preset", "p5", "-rc", "vbr", "-cq", "18", "-b:v", "0"]
+    if encoder == "libsvtav1":
+        return ["-c:v", encoder, "-preset", "8", "-crf", "24"]
+    return ["-c:v", encoder, "-preset", "fast", "-crf", "16" if encoder == "libx264" else "18"]
+
+
+def _encode_matching(inputs: list[str], vf: str, sig: tuple, out: Path, caps: Caps, extra: Sequence[str] = ()) -> None:
+    codec = sig[0]
+    error = None
+    for enc in conform_encoders(codec, caps):
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", *inputs, "-an", "-vf", vf,
+               *extra, *conform_encoder_args(enc), str(out)]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+            return
+        except subprocess.CalledProcessError as e:
+            error = e
+    raise RuntimeError(f"Could not re-encode {inputs[-1]}:\n{error.stderr[-1500:] if error else ''}")
+
+
+def conform_clip(clip: ClipInfo, sig: tuple, out: Path, caps: Caps) -> ClipInfo:
+    """Re-encode ``clip`` to the majority's codec, size, frame rate and pixel format
+    (cropping to their aspect ratio) so it can be joined with the others."""
+    codec, w, h, fps, pix = sig
+    cw, ch, x, y = crop_box(clip.width, clip.height, w, h)
+    vf = f"crop={cw}:{ch}:{x}:{y},scale={w}:{h}:flags=lanczos,setsar=1,fps={fps_arg(fps)},format={pix}"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    _encode_matching(["-i", str(clip.path)], vf, sig, out, caps)
+    return ClipInfo(out, codec, w, h, fps, pix, media_duration(out))
+
+
+def hold_clip(last: ClipInfo, seconds: float, sig: tuple, work: Path, caps: Caps) -> ClipInfo:
+    """A clip of ``last``'s final frame, ``seconds`` long, matching the majority format."""
+    codec, w, h, fps, pix = sig
+    still = work / "last_frame.png"
+    subprocess.run(
+        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-sseof", "-1", "-i", str(last.path),
+         "-update", "1", str(still)],
+        check=True, capture_output=True, text=True,
+    )
+    frames = max(1, round(seconds * fps))
+    out = work / "hold.mp4"
+    _encode_matching(
+        ["-loop", "1", "-framerate", fps_arg(fps), "-i", str(still)],
+        f"scale={w}:{h}:flags=lanczos,setsar=1,format={pix}", sig, out, caps, ["-frames:v", str(frames)],
+    )
+    return ClipInfo(out, codec, w, h, fps, pix, frames / float(fps))
+
+
+def prepare_clips(clips: Sequence[ClipInfo], narration_seconds: float, work: Path, caps: Caps) -> list[ClipInfo]:
+    """Make every clip share one format (re-encoding only the odd ones out) and append
+    a still of the last frame if the clips run short, so the whole list can be read
+    by one concat demuxer and stay on the full GPU path."""
+    sig = majority_signature(clips)
+    prepared = list(clips)
+    odd = [i for i, c in enumerate(clips) if c.signature != sig]
+    if odd:
+        codec, w, h, fps, pix = sig
+        print(f"{len(odd)} of {len(clips)} clips differ from the rest ({w}x{h} {codec} @ {float(fps):g} fps); "
+              "re-encoding those to match", flush=True)
+        for i in tqdm(odd, desc="Matching clips", unit="clip"):
+            prepared[i] = conform_clip(clips[i], sig, work / "conformed" / f"{i:05d}.mp4", caps)
+    hold = hold_seconds(prepared, narration_seconds)
+    if hold:
+        print(f"Clips are {hold:.2f}s shorter than the narration; holding the last frame", flush=True)
+        prepared.append(hold_clip(prepared[-1], hold, sig, work, caps))
+    return prepared
 
 
 def build_clip_command(
@@ -455,30 +611,27 @@ def build_clip_command(
     output_path: Path,
     caps: Caps | None = None,
 ) -> list[str]:
-    """ffmpeg command for the clip-background video.
+    """ffmpeg command for the clip-background video. The clips must share one format
+    (see ``prepare_clips``).
 
     ``mode`` is ``gpu`` (decode, crop, scale, overlay and encode on the GPU), ``hybrid``
     (GPU decode and encode, CPU filters) or ``cpu``.
     """
+    if not plan.uniform:
+        raise ValueError("Clips must share one format; run prepare_clips first.")
     w, h, fps = plan.out_w, plan.out_h, plan.fps
-    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning", "-stats"]
-    cards_input = ["-f", "concat", "-safe", "0", "-i", str(cards_list)]
-    hw_decode = ["-hwaccel", "cuda"] if mode == "hybrid" else []
-    tpad = f",tpad=stop_mode=clone:stop_duration={plan.pad_seconds:.6f}" if plan.pad_seconds else ""
+    first = plan.clips[0]
+    cw, ch, x, y = crop_box(first.width, first.height, w, h)
+    clips_input = ["-f", "concat", "-safe", "0", "-i", str(clips_list)]
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning"]
 
     if mode == "gpu":
-        if not plan.uniform or plan.pad_seconds:
-            raise ValueError("The full GPU path needs uniform clips and no end padding.")
-        first = plan.clips[0]
-        cw, ch, x, y = crop_box(first.width, first.height, w, h)
         crop = f"{y}x{first.height - ch - y}x{x}x{first.width - cw - x}"  # top x bottom x left x right
         cmd += [
             # One shared CUDA device for the decoder and the filters (hwupload, overlay_cuda).
             "-init_hw_device", "cuda=gpu:0", "-filter_hw_device", "gpu",
             "-hwaccel", "cuda", "-hwaccel_device", "gpu", "-hwaccel_output_format", "cuda",
-            "-c:v", f"{first.codec}_cuvid", "-crop", crop,
-            "-f", "concat", "-safe", "0", "-i", str(clips_list),
-            *cards_input, "-i", str(audio_path),
+            "-c:v", f"{first.codec}_cuvid", "-crop", crop, *clips_input,
         ]
         lanczos = ":interp_algo=lanczos" if caps is None or "interp_algo" in caps.scale_cuda_opts else ""
         graph = (
@@ -486,31 +639,18 @@ def build_clip_command(
             f"[1:v]format=yuva420p,hwupload[subs];"
             f"[bg][subs]overlay_cuda=x=0:y=0[v]"
         )
-        audio_index = 2
     else:
-        scale = f"scale={w}:{h}:flags=lanczos,setsar=1"
-        if plan.uniform:
-            first = plan.clips[0]
-            cw, ch, x, y = crop_box(first.width, first.height, w, h)
-            cmd += [*hw_decode, "-f", "concat", "-safe", "0", "-i", str(clips_list)]
-            bg = f"[0:v]crop={cw}:{ch}:{x}:{y},{scale},fps={fps_arg(fps)}{tpad}[bg];"
-            n_video = 1
-        else:
-            parts, labels = [], []
-            for i, clip in enumerate(plan.clips):
-                cmd += [*hw_decode, "-i", str(clip.path)]
-                cw, ch, x, y = crop_box(clip.width, clip.height, w, h)
-                parts.append(f"[{i}:v]crop={cw}:{ch}:{x}:{y},{scale},fps={fps_arg(fps)},format=yuv420p[c{i}];")
-                labels.append(f"[c{i}]")
-            n_video = len(plan.clips)
-            bg = "".join(parts) + f"{''.join(labels)}concat=n={n_video}:v=1:a=0{tpad}[bg];"
-        cmd += [*cards_input, "-i", str(audio_path)]
-        graph = bg + f"[{n_video}:v]format=rgba[subs];[bg][subs]overlay=0:0:format=auto,format=yuv420p[v]"
-        audio_index = n_video + 1
+        cmd += [*(["-hwaccel", "cuda"] if mode == "hybrid" else []), *clips_input]
+        graph = (
+            f"[0:v]crop={cw}:{ch}:{x}:{y},scale={w}:{h}:flags=lanczos,setsar=1,fps={fps_arg(fps)}[bg];"
+            f"[1:v]format=rgba[subs];[bg][subs]overlay=0:0:format=auto,format=yuv420p[v]"
+        )
 
     cmd += [
+        "-f", "concat", "-safe", "0", "-i", str(cards_list),
+        "-i", str(audio_path),
         "-filter_complex", graph,
-        "-map", "[v]", "-map", f"{audio_index}:a:0",
+        "-map", "[v]", "-map", "2:a:0",
         "-r", fps_arg(fps), "-fps_mode", "cfr",
         *youtube_encoder_args(encoder, fps),
         "-t", f"{plan.duration:.6f}",
@@ -528,7 +668,7 @@ def clip_attempts(plan: ClipPlan, encoder: str, caps: Caps) -> list[tuple[str, s
     else:
         nvencs = [encoder]
     attempts = []
-    if nvencs and plan.uniform and not plan.pad_seconds and caps.full_gpu(plan.clips[0].codec):
+    if nvencs and plan.uniform and caps.full_gpu(plan.clips[0].codec):
         attempts += [("gpu", e) for e in nvencs]
     attempts += [("hybrid", e) for e in nvencs]
     if encoder == "auto":
@@ -544,18 +684,16 @@ def render_clip_video(
     encoder: str = "auto",
     work: Path | None = None,
     style: Style = VIDEO_STYLE,
+    probe_cache: Path | None = None,
 ) -> Path:
     clip_paths = find_clips(clips)
-    infos = [probe_clip(p) for p in clip_paths]
+    infos = probe_clips(clip_paths, probe_cache)
     narration = media_duration(audio_path)
-    plan = plan_clips(infos, narration, style)
-    clip_total = sum(c.duration for c in infos)
-    first = infos[0]
+    caps = ffmpeg_caps()
+    codec, cw, ch, fps, _ = majority_signature(infos)
     print(
-        f"{len(infos)} clip(s), {first.width}x{first.height} {first.codec} @ {float(plan.fps):g} fps, "
-        f"{clip_total:.2f}s total; narration {narration:.2f}s"
-        + (f"; holding the last frame {plan.pad_seconds:.2f}s" if plan.pad_seconds else "")
-        + ("" if plan.uniform else "; clips differ, normalizing each one"),
+        f"{len(infos)} clip(s), {cw}x{ch} {codec} @ {float(fps):g} fps, "
+        f"{sum(c.duration for c in infos):.2f}s total; narration {narration:.2f}s",
         flush=True,
     )
 
@@ -563,16 +701,17 @@ def render_clip_video(
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(work) if work else Path(tmp)
         work.mkdir(parents=True, exist_ok=True)
+        prepared = prepare_clips(infos, narration, work, caps)
+        plan = plan_clips(prepared, narration, style)
         cards_list, _ = build_card_timeline(
             cues, plan.fps, narration, work, lambda text: render_card(text, font, style, transparent=True)
         )
         clips_list = work / "clips.txt"
         with clips_list.open("w", encoding="utf-8") as fh:
             fh.write("ffconcat version 1.0\n")
-            for clip in infos:
+            for clip in prepared:
                 fh.write(concat_line(clip.path.resolve()))
 
-        caps = ffmpeg_caps()
         attempts = clip_attempts(plan, encoder, caps)
         if not attempts:
             raise RuntimeError(f"Encoder {encoder} is not usable here.")
@@ -601,6 +740,7 @@ def render_video(
     keep_frames: bool = False,
     style: Style | None = None,
     background_clips: Path | Sequence[Path] | None = None,
+    probe_cache: Path | None = None,
 ) -> Path:
     """Render cues over the audio of ``audio_path`` (audio or video) into ``output_path``.
 
@@ -614,7 +754,7 @@ def render_video(
 
     if background_clips is not None:
         return render_clip_video(
-            cues, audio_path, output_path, background_clips, encoder, frames_dir, style or VIDEO_STYLE
+            cues, audio_path, output_path, background_clips, encoder, frames_dir, style or VIDEO_STYLE, probe_cache
         )
 
     style = style or STYLE
