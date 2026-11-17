@@ -958,6 +958,15 @@ def benchmark_routes(
     if nvenc:
         routes.append(("hybrid", nvenc))
     routes.append(("cpu", "libx264"))
+    # Untimed warm-up, so one-time GPU setup (CUDA kernel compilation, NVENC init) doesn't
+    # count against whichever route happens to run first.
+    warm = ClipPlan(local[:1], plan.fps, min(plan.end_frame, round(plan.fps)), plan.out_w, plan.out_h)
+    try:
+        mode, enc = routes[0]
+        subprocess.run(build_clip_command(warm, mode, enc, clips_list, cards_list, audio_path,
+                                          bdir / "warmup.mp4", caps), check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        pass
     for mode, enc in routes:
         out = bdir / f"{mode}.mp4"
         cmd = build_clip_command(plan, mode, enc, clips_list, cards_list, audio_path, out, caps)
