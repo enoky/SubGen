@@ -160,7 +160,9 @@ minute) and stops, without transcribing or encoding.
 Before transcription, the narration is loudness-normalized for YouTube: two-pass
 EBU R128 to -14 LUFS integrated and -1.5 dBTP true peak, saved as 48 kHz 24-bit WAV.
 The normalized audio is what gets transcribed and put in the video, and it is also
-saved to `output/narration_norm.wav`. Change the target with `--lufs` / `--true-peak`,
+saved to `output/narration_norm.wav`. Later runs reuse it (from local disk in the same
+Colab session, otherwise from Drive) while `narration.wav` and the loudness settings
+are unchanged, so reruns skip the few minutes normalization takes. Change the target with `--lufs` / `--true-peak`,
 or skip this step with `--no-normalize`.
 
 The same pipeline runs anywhere with `uv run python -m drive_pipeline --root DIR`.
