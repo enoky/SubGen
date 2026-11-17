@@ -9,6 +9,8 @@ Expected layout under ``--root`` (Colab: /content/drive/MyDrive/subgen):
 
 The narration is first loudness-normalized for YouTube (-14 LUFS, -1.5 dBTP,
 48 kHz); the normalized audio is what gets transcribed and put in the video.
+The result is reused on later runs while narration.wav and the loudness settings
+are unchanged (checked against output/.narration_norm.json).
 
 The clips are first copied to local disk, 16 at a time: a single Drive read
 stream is slower than the GPU encode (it capped full runs at ~2.6x realtime),
@@ -32,6 +34,7 @@ Usage (Colab, after mounting Drive):
 from __future__ import annotations
 
 import argparse
+import json
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 import tempfile
@@ -51,6 +54,56 @@ def copy_in(src: Path, dst_dir: Path) -> Path:
     dst = dst_dir / src.name
     shutil.copyfile(src, dst)
     return dst
+
+
+NORM_META = ".narration_norm.json"
+
+
+def normalized_narration(
+    audio_src: Path, out_dir: Path, work_in: Path, lufs: float, true_peak: float
+) -> Path:
+    """Loudness-normalized copy of ``audio_src`` on local disk.
+
+    Normalizing a long narration takes minutes, so the result is reused while the
+    source file (name, size, modification time) and the settings are unchanged:
+    first from local disk (same Colab session), then from the copy saved on Drive.
+    Each copy has a small JSON file next to it describing what it was made from."""
+    st = audio_src.stat()
+    key = {"source": audio_src.name, "size": st.st_size, "mtime_ns": st.st_mtime_ns,
+           "lufs": lufs, "true_peak": true_peak, "sample_rate": normalize_audio.SAMPLE_RATE,
+           "codec": normalize_audio.CODEC}
+    name = f"{audio_src.stem}{normalize_audio.SUFFIX}.wav"
+    local, local_meta = work_in / name, work_in / NORM_META
+    saved, saved_meta = out_dir / name, out_dir / NORM_META
+
+    def matches(meta: Path, wav: Path) -> bool:
+        try:
+            return wav.is_file() and json.loads(meta.read_text(encoding="utf-8")) == key
+        except (OSError, ValueError):
+            return False
+
+    work_in.mkdir(parents=True, exist_ok=True)
+    if matches(local_meta, local):
+        print(f"Reusing normalized narration {local} (narration.wav unchanged)", flush=True)
+        return local
+    if matches(saved_meta, saved):
+        print(f"Reusing normalized narration {saved} (narration.wav unchanged)", flush=True)
+        local_meta.unlink(missing_ok=True)
+        shutil.copyfile(saved, local)
+        local_meta.write_text(json.dumps(key), encoding="utf-8")
+        return local
+
+    print(f"Copying narration from {audio_src.parent}", flush=True)
+    raw = copy_in(audio_src, work_in)
+    print(f"Normalizing narration to {lufs:g} LUFS, {true_peak:g} dBTP", flush=True)
+    local_meta.unlink(missing_ok=True)
+    saved_meta.unlink(missing_ok=True)
+    normalize_audio.normalize(raw, local, lufs, true_peak)
+    local_meta.write_text(json.dumps(key), encoding="utf-8")
+    shutil.copyfile(local, saved)
+    saved_meta.write_text(json.dumps(key), encoding="utf-8")  # written last: marks the Drive copy complete
+    print(f"Saved {saved}", flush=True)
+    return local
 
 
 def copy_clips(srcs: list[Path], dst_dir: Path, workers: int = 16) -> list[Path]:
@@ -153,15 +206,18 @@ def main(argv: list[str] | None = None) -> int:
         tmp = tempfile.TemporaryDirectory()
         work = Path(tmp.name)
     if work.exists():
-        for name in ("narration", "script"):  # keep input/clips so the next run can skip copying them
-            for old in (work / "input").glob(f"{name}*"):
-                old.unlink()
+        # Keep input/clips and the normalized narration so the next run can reuse them.
+        for old in (work / "input").glob("script*"):
+            old.unlink()
     local_out = work / "output"
     local_out.mkdir(parents=True, exist_ok=True)
 
     try:
-        print(f"Copying narration from {root} to {work}", flush=True)
-        audio = copy_in(audio_src, work / "input")
+        if args.benchmark or args.check_routes or args.no_normalize:
+            print(f"Copying narration from {root} to {work}", flush=True)
+            audio = copy_in(audio_src, work / "input")
+        else:
+            audio = normalized_narration(audio_src, out_dir, work / "input", args.lufs, args.true_peak)
         if args.benchmark:
             srt2mp4.benchmark_routes(
                 clips_src, audio, work, probe_cache=out_dir / ".clip_info_cache.json",
@@ -174,13 +230,6 @@ def main(argv: list[str] | None = None) -> int:
                 cpu_filters=args.cpu_filters, check_only=True,
             )
             return 0
-        if not args.no_normalize:
-            print(f"Normalizing narration to {args.lufs:g} LUFS, {args.true_peak:g} dBTP", flush=True)
-            normalized = audio.with_name(f"{audio.stem}{normalize_audio.SUFFIX}.wav")
-            normalize_audio.normalize(audio, normalized, args.lufs, args.true_peak)
-            audio = normalized
-            shutil.copyfile(audio, out_dir / audio.name)
-            print(f"Saved {out_dir / audio.name}", flush=True)
         clips = copy_clips(clips_src, work / "input" / "clips") if clips_src and not args.stream_clips else clips_src
         srt_path = local_out / srt_name
         mp4_path = local_out / mp4_name
