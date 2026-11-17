@@ -34,6 +34,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from collections import Counter
 from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -613,6 +614,7 @@ def prepare_clips(clips: Sequence[ClipInfo], narration_seconds: float, work: Pat
 
 
 ROUTE_LABELS = {
+    "gpu_plain": "old all-GPU route (can show the green line; benchmark only)",
     "gpu_overscan": "GPU decode/scale/overlay/encode, 1.5% overscan",
     "gpu_overscan_canvas": "GPU decode/scale/overlay/encode, 1.5% overscan on an uploaded canvas",
     "gpu_overscan_download": "GPU decode/scale/overlay/encode, 1.5% overscan cropped on the CPU",
@@ -672,7 +674,7 @@ def build_clip_command(
     )
 
     extra_inputs: list[str] = []
-    if mode in ("gpu_overscan", "gpu_overscan_canvas", "gpu_overscan_download"):
+    if mode in ("gpu_plain", "gpu_overscan", "gpu_overscan_canvas", "gpu_overscan_download"):
         crop = f"{y}x{first.height - ch - y}x{x}x{first.width - cw - x}"  # top x bottom x left x right
         cmd += [
             *cuda_device,
@@ -681,7 +683,9 @@ def build_clip_command(
         ]
         mx, my = overscan_margins(w, h)
         big = f"scale_cuda=w={w + 2 * mx}:h={h + 2 * my}{lanczos}:format=yuv420p"
-        if mode == "gpu_overscan":
+        if mode == "gpu_plain":  # the original route, kept to compare speeds in benchmark_routes
+            graph = "[0:v]" + cuda_tail
+        elif mode == "gpu_overscan":
             nearest = ":interp_algo=nearest" if lanczos else ""
             graph = (
                 f"[0:v]split=2[a][b];"
@@ -894,6 +898,81 @@ def verify_routes(
         print(f"  {label}: {'OK' if verdicts[mode] else 'edge artifact, skipping'} (edge score {defect:.1f})",
               flush=True)
     return [a for a in attempts if a[0] not in GPU_ROUTES or verdicts.get(a[0])]
+
+
+def benchmark_routes(
+    clips: Path | Sequence[Path],
+    audio_path: Path,
+    work: Path,
+    seconds: float = 40.0,
+    probe_cache: Path | None = None,
+) -> list[tuple[str, float | None]]:
+    """Time each video route on the same ~``seconds`` of real clips, copied to local
+    disk first so only the route itself is measured, and time that copy to measure
+    how fast the clips read from their source (e.g. Drive). Prints a summary and
+    returns ``[(route or 'read', x realtime or None if it failed)]``."""
+    caps = ffmpeg_caps()
+    infos = probe_clips(find_clips(clips), probe_cache)
+    sig = majority_signature(infos)
+    sample, total = [], 0.0
+    for c in infos:
+        if c.signature == sig:
+            sample.append(c)
+            total += c.duration
+            if total >= seconds:
+                break
+    bdir = work / "benchmark"
+    shutil.rmtree(bdir, ignore_errors=True)
+    (bdir / "clips").mkdir(parents=True)
+    results: list[tuple[str, float | None]] = []
+
+    print(f"Benchmark on {len(sample)} clip(s), {total:.1f}s of video", flush=True)
+    start = time.monotonic()
+    nbytes = 0
+    local = []
+    for c in sample:
+        dst = bdir / "clips" / c.path.name
+        shutil.copyfile(c.path, dst)
+        nbytes += dst.stat().st_size
+        local.append(ClipInfo(dst, *c.signature, c.duration))
+    took = max(time.monotonic() - start, 1e-6)
+    read_x = total / took
+    results.append(("read", read_x))
+    print(f"  reading clips from source: {nbytes / took / 1e6:.1f} MB/s = {read_x:.1f}x realtime", flush=True)
+
+    plan = ClipPlan(local, sig[3], round(total * sig[3]))
+    clips_list, cards_list = bdir / "clips.txt", bdir / "cards.txt"
+    clips_list.write_text("ffconcat version 1.0\n" + "".join(concat_line(c.path.resolve()) for c in local), encoding="utf-8")
+    blank = bdir / "blank.png"
+    Image.new("RGBA", (plan.out_w, plan.out_h), (0, 0, 0, 0)).save(blank)
+    cards_list.write_text(
+        "ffconcat version 1.0\n" + concat_line(blank) + f"duration {plan.duration:.6f}\n" + concat_line(blank),
+        encoding="utf-8",
+    )
+
+    nvenc = next((e for e in NVENC_ENCODERS if e in caps.encoders), None) if caps.gpu else None
+    routes = []
+    if nvenc and caps.cuda_filters() and caps.full_gpu(sig[0]):
+        routes += [("gpu_plain", nvenc), ("gpu_overscan", nvenc), ("gpu_overscan_canvas", nvenc),
+                   ("gpu_overscan_download", nvenc)]
+    if nvenc:
+        routes.append(("hybrid", nvenc))
+    routes.append(("cpu", "libx264"))
+    for mode, enc in routes:
+        out = bdir / f"{mode}.mp4"
+        cmd = build_clip_command(plan, mode, enc, clips_list, cards_list, audio_path, out, caps)
+        start = time.monotonic()
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            tail = " | ".join((e.stderr or "").strip().splitlines()[-2:])
+            print(f"  {ROUTE_LABELS[mode]}: failed ({tail})", flush=True)
+            results.append((mode, None))
+            continue
+        x = plan.duration / max(time.monotonic() - start, 1e-6)
+        results.append((mode, x))
+        print(f"  {ROUTE_LABELS[mode]} [{enc}]: {x:.1f}x realtime ({x * float(plan.fps):.0f} fps)", flush=True)
+    return results
 
 
 def render_clip_video(
