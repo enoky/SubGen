@@ -10,9 +10,10 @@ Two backgrounds are supported:
 * Video clips (``--clips DIR``): every ``*.mp4`` in DIR is concatenated in
   natural filename order, center-cropped to 16:9, scaled to 1920x1080, and the
   cards (now transparent, with a black outline for readability) are overlaid on
-  top. The clips' own audio is dropped. On an NVIDIA GPU the whole chain runs on
-  the GPU (NVDEC decode + crop, scale_cuda, overlay_cuda, NVENC); otherwise it
-  falls back to GPU decode/encode with CPU filters, then to CPU only.
+  top. The clips' own audio is dropped. On an NVIDIA GPU, decoding (NVDEC) and
+  encoding (NVENC) run on the GPU and crop/scale/overlay on all CPU cores;
+  without one, everything runs on the CPU. --gpu-filters moves the filters to
+  the GPU too (experimental: it can leave a green line at the bottom edge).
   All clips are read through one concat demuxer input, so thousands of clips
   are fine. Clips that differ from the majority format are re-encoded to match,
   and a still of the last frame is appended if the clips run short.
@@ -640,6 +641,8 @@ def build_clip_command(
             f"[bg][subs]overlay_cuda=x=0:y=0[v]"
         )
     else:
+        # Crop, Lanczos scale and overlay are frame-parallel on the CPU, so use every core.
+        cmd += ["-filter_complex_threads", str(os.cpu_count() or 1)]
         cmd += [*(["-hwaccel", "cuda"] if mode == "hybrid" else []), *clips_input]
         graph = (
             f"[0:v]crop={cw}:{ch}:{x}:{y},scale={w}:{h}:flags=lanczos,setsar=1,fps={fps_arg(fps)}[bg];"
@@ -659,8 +662,13 @@ def build_clip_command(
     return cmd
 
 
-def clip_attempts(plan: ClipPlan, encoder: str, caps: Caps) -> list[tuple[str, str]]:
-    """Ordered (mode, encoder) attempts, fastest first; later ones are fallbacks."""
+def clip_attempts(plan: ClipPlan, encoder: str, caps: Caps, gpu_filters: bool = False) -> list[tuple[str, str]]:
+    """Ordered (mode, encoder) attempts; later ones are fallbacks.
+
+    The default is GPU decode and encode with crop, scale and overlay on the CPU.
+    The all-GPU filter chain (``gpu_filters``) is opt-in: on some setups it leaves a
+    green line along the bottom edge (the NVDEC crop or CUDA scaler sampling past
+    the picture), which the CPU filters never do."""
     if encoder == "libx264":
         return [("cpu", "libx264")]
     if encoder == "auto":
@@ -668,7 +676,7 @@ def clip_attempts(plan: ClipPlan, encoder: str, caps: Caps) -> list[tuple[str, s
     else:
         nvencs = [encoder]
     attempts = []
-    if nvencs and plan.uniform and caps.full_gpu(plan.clips[0].codec):
+    if gpu_filters and nvencs and plan.uniform and caps.full_gpu(plan.clips[0].codec):
         attempts += [("gpu", e) for e in nvencs]
     attempts += [("hybrid", e) for e in nvencs]
     if encoder == "auto":
@@ -685,6 +693,7 @@ def render_clip_video(
     work: Path | None = None,
     style: Style = VIDEO_STYLE,
     probe_cache: Path | None = None,
+    gpu_filters: bool = False,
 ) -> Path:
     clip_paths = find_clips(clips)
     infos = probe_clips(clip_paths, probe_cache)
@@ -712,7 +721,7 @@ def render_clip_video(
             for clip in prepared:
                 fh.write(concat_line(clip.path.resolve()))
 
-        attempts = clip_attempts(plan, encoder, caps)
+        attempts = clip_attempts(plan, encoder, caps, gpu_filters)
         if not attempts:
             raise RuntimeError(f"Encoder {encoder} is not usable here.")
         for n, (mode, enc) in enumerate(attempts, 1):
@@ -741,6 +750,7 @@ def render_video(
     style: Style | None = None,
     background_clips: Path | Sequence[Path] | None = None,
     probe_cache: Path | None = None,
+    gpu_filters: bool = False,
 ) -> Path:
     """Render cues over the audio of ``audio_path`` (audio or video) into ``output_path``.
 
@@ -754,7 +764,8 @@ def render_video(
 
     if background_clips is not None:
         return render_clip_video(
-            cues, audio_path, output_path, background_clips, encoder, frames_dir, style or VIDEO_STYLE, probe_cache
+            cues, audio_path, output_path, background_clips, encoder, frames_dir, style or VIDEO_STYLE, probe_cache,
+            gpu_filters,
         )
 
     style = style or STYLE
@@ -802,6 +813,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("output", type=Path, nargs="?", help="Defaults to the .srt path with an .mp4 extension.")
     ap.add_argument("--clips", type=Path, help="Directory of .mp4 clips to use as the background.")
     ap.add_argument(
+        "--gpu-filters", action="store_true",
+        help="Crop, scale and overlay on the GPU too (experimental; may leave a green edge line).",
+    )
+    ap.add_argument(
         "--encoder", choices=ENCODERS, default="auto",
         help="auto: h264_nvenc then libx264 (bluescreen); hevc_nvenc, h264_nvenc, then libx264 (--clips).",
     )
@@ -818,7 +833,7 @@ def main(argv: list[str] | None = None) -> int:
     cues = parse_srt(args.srt)
     output = render_video(
         cues, args.audio, args.output or args.srt.with_suffix(".mp4"), args.encoder, args.keep_frames,
-        background_clips=args.clips,
+        background_clips=args.clips, gpu_filters=args.gpu_filters,
     )
     print(f"Wrote {output}")
     return 0
