@@ -613,12 +613,16 @@ def prepare_clips(clips: Sequence[ClipInfo], narration_seconds: float, work: Pat
 
 
 ROUTE_LABELS = {
-    "gpu": "full GPU",
+    "gpu_overscan": "GPU decode/scale/overlay/encode, 1.5% overscan",
     "gpu_upload": "GPU decode/scale/overlay/encode, CPU crop",
     "hybrid": "GPU decode/encode + CPU filters",
     "cpu": "CPU",
 }
-GPU_ROUTES = ("gpu", "gpu_upload")
+GPU_ROUTES = ("gpu_overscan", "gpu_upload")
+# The overscan route renders this many extra pixels on each side and crops them off,
+# so anything the GPU decoder or scaler leaves along the frame edges (e.g. a thin green
+# line at the bottom) is discarded. 8 output rows cover ~4 source rows at 2x upscaling.
+OVERSCAN_Y = 8
 
 
 def build_clip_command(
@@ -634,7 +638,9 @@ def build_clip_command(
     """ffmpeg command for the clip-background video. The clips must share one format
     (see ``prepare_clips``). ``mode`` is one of:
 
-    * ``gpu``: NVDEC decode with its built-in crop, CUDA scale and overlay, NVENC.
+    * ``gpu_overscan``: NVDEC decode with its built-in crop, CUDA scale to slightly
+      larger than the output and overlay, then the extra border is cropped off on the
+      CPU (free) and NVENC encodes from system memory.
     * ``gpu_upload``: NVDEC decode, crop on the CPU (just a pointer offset on the small
       source frame), then CUDA scale and overlay and NVENC.
     * ``hybrid``: NVDEC decode and NVENC encode, crop/scale/overlay on all CPU cores.
@@ -656,17 +662,31 @@ def build_clip_command(
         f"[bg][subs]overlay_cuda=x=0:y=0[v]"
     )
 
-    if mode == "gpu":
+    if mode == "gpu_overscan":
         crop = f"{y}x{first.height - ch - y}x{x}x{first.width - cw - x}"  # top x bottom x left x right
         cmd += [
             *cuda_device,
             "-hwaccel", "cuda", "-hwaccel_device", "gpu", "-hwaccel_output_format", "cuda",
             "-c:v", f"{first.codec}_cuvid", "-crop", crop, *clips_input,
         ]
-        graph = "[0:v]" + cuda_tail
+        mx, my = overscan_margins(w, h)
+        graph = (
+            f"[0:v]scale_cuda=w={w + 2 * mx}:h={h + 2 * my}{lanczos}:format=yuv420p[big];"
+            f"[1:v]format=yuva420p,hwupload[subs];"
+            f"[big][subs]overlay_cuda=x={mx}:y={my},hwdownload,format=yuv420p,crop={w}:{h}:{mx}:{my}[v]"
+        )
     elif mode == "gpu_upload":
         cmd += [*cuda_device, "-hwaccel", "cuda", "-hwaccel_device", "gpu", *clips_input]
         graph = f"[0:v]crop={cw}:{ch}:{x}:{y},format=nv12,hwupload," + cuda_tail
+    elif mode == "cpu_overscan":
+        # CPU twin of gpu_overscan, used only as the reference when checking that route.
+        mx, my = overscan_margins(w, h)
+        cmd += [*clips_input]
+        graph = (
+            f"[0:v]crop={cw}:{ch}:{x}:{y},scale={w + 2 * mx}:{h + 2 * my}:flags=lanczos,setsar=1[big];"
+            f"[1:v]format=rgba[subs];[big][subs]overlay={mx}:{my}:format=auto,format=yuv420p,"
+            f"crop={w}:{h}:{mx}:{my}[v]"
+        )
     else:
         # Crop, Lanczos scale and overlay are frame-parallel on the CPU, so use every core.
         cmd += ["-filter_complex_threads", str(os.cpu_count() or 1)]
@@ -689,6 +709,12 @@ def build_clip_command(
     return cmd
 
 
+def overscan_margins(w: int, h: int) -> tuple[int, int]:
+    """Even (x, y) margins that keep the aspect ratio: 1920x1080 -> (14, 8)."""
+    my = OVERSCAN_Y
+    return 2 * round(w * my / h / 2), my
+
+
 def clip_attempts(
     plan: ClipPlan, encoder: str, caps: Caps, cpu_filters: bool = False
 ) -> list[tuple[str, str]]:
@@ -702,8 +728,8 @@ def clip_attempts(
         nvencs = [encoder]
     attempts = []
     if not cpu_filters and nvencs and plan.uniform and caps.cuda_filters():
-        if caps.full_gpu(plan.clips[0].codec):
-            attempts += [("gpu", e) for e in nvencs]
+        if caps.full_gpu(plan.clips[0].codec) and "hwdownload" in caps.filters:
+            attempts += [("gpu_overscan", e) for e in nvencs]
         attempts += [("gpu_upload", e) for e in nvencs]
     attempts += [("hybrid", e) for e in nvencs]
     if encoder == "auto":
@@ -778,11 +804,14 @@ def verify_routes(
         return decode_frame(out, index, plan.out_w, plan.out_h)
 
     print("Checking the GPU routes against a CPU render of the first clip", flush=True)
-    try:
-        reference = render("cpu", "libx264", "reference.mp4")
-    except (subprocess.CalledProcessError, RuntimeError) as e:
-        print(f"  could not make the CPU reference ({e}); using the CPU-filter routes", flush=True)
-        return [a for a in attempts if a[0] not in GPU_ROUTES]
+    references: dict[str, bytes] = {}
+
+    def reference(mode: str) -> bytes:
+        # Same framing as the route under test, so only artifacts differ.
+        ref_mode = "cpu_overscan" if mode == "gpu_overscan" else "cpu"
+        if ref_mode not in references:
+            references[ref_mode] = render(ref_mode, "libx264", f"reference_{ref_mode}.mp4")
+        return references[ref_mode]
 
     verdicts: dict[str, bool] = {}
     for mode, enc in attempts:
@@ -790,7 +819,13 @@ def verify_routes(
             continue
         label = ROUTE_LABELS[mode]
         try:
-            defect = edge_defect(render(mode, enc, f"{mode}.mp4"), reference, plan.out_w, plan.out_h)
+            ref = reference(mode)
+        except (subprocess.CalledProcessError, RuntimeError) as e:
+            print(f"  {label}: could not make the CPU reference ({e}); skipping", flush=True)
+            verdicts[mode] = False
+            continue
+        try:
+            defect = edge_defect(render(mode, enc, f"{mode}.mp4"), ref, plan.out_w, plan.out_h)
         except subprocess.CalledProcessError as e:
             tail = " | ".join((e.stderr or "").strip().splitlines()[-2:])
             print(f"  {label}: not available ({tail or 'ffmpeg failed'})", flush=True)

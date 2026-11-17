@@ -13,7 +13,7 @@ def clip(name="clip1.mp4", codec="h264", w=1280, h=704, fps=24, pix="yuv420p", d
 GPU_CAPS = s.Caps(
     encoders=frozenset({"hevc_nvenc", "h264_nvenc", "libx264"}),
     decoders=frozenset({"h264_cuvid"}),
-    filters=frozenset({"scale_cuda", "overlay_cuda", "hwupload"}),
+    filters=frozenset({"scale_cuda", "overlay_cuda", "hwupload", "hwdownload"}),
     scale_cuda_opts=frozenset({"format", "interp_algo"}),
     gpu=True,
 )
@@ -60,7 +60,7 @@ def test_majority_signature_ignores_odd_clip():
 def test_attempt_order_on_gpu():
     plan = s.plan_clips([clip(), clip("clip2.mp4")], 20.0)
     assert s.clip_attempts(plan, "auto", GPU_CAPS) == [
-        ("gpu", "hevc_nvenc"), ("gpu", "h264_nvenc"),
+        ("gpu_overscan", "hevc_nvenc"), ("gpu_overscan", "h264_nvenc"),
         ("gpu_upload", "hevc_nvenc"), ("gpu_upload", "h264_nvenc"),
         ("hybrid", "hevc_nvenc"), ("hybrid", "h264_nvenc"),
         ("cpu", "libx264"),
@@ -83,27 +83,32 @@ def build(plan, mode, enc="hevc_nvenc"):
     return s.build_clip_command(plan, mode, enc, Path("clips.txt"), Path("cards.txt"), Path("n.wav"), Path("o.mp4"), GPU_CAPS)
 
 
-def test_gpu_command():
-    cmd = build(s.plan_clips([clip(), clip("clip2.mp4")], 20.0), "gpu")
+def test_gpu_overscan_command():
+    cmd = build(s.plan_clips([clip(), clip("clip2.mp4")], 20.0), "gpu_overscan")
     joined = " ".join(cmd)
     assert "-c:v h264_cuvid -crop 0x0x14x14" in joined
     graph = cmd[cmd.index("-filter_complex") + 1]
-    assert "scale_cuda=w=1920:h=1080:interp_algo=lanczos:format=yuv420p" in graph
-    assert "overlay_cuda" in graph
+    # scaled 1.5% larger, overlaid with the matching offset, then the border is cut off
+    assert "scale_cuda=w=1948:h=1096:interp_algo=lanczos:format=yuv420p" in graph
+    assert "overlay_cuda=x=14:y=8,hwdownload,format=yuv420p,crop=1920:1080:14:8[v]" in graph
     assert cmd[cmd.index("-map") + 3] == "2:a:0"  # narration audio, never the clips'
     assert "-tag:v hvc1" in joined and "-movflags +faststart" in joined
     assert "-g 48" in joined and "-b:a 384k" in joined and "-ar 48000" in joined
     assert joined.count("-i ") == 3  # clips list, cards list, narration: never one input per clip
 
 
+def test_overscan_margins_keep_aspect():
+    assert s.overscan_margins(1920, 1080) == (14, 8)
+
+
 def test_command_rejects_mixed_clips():
     with pytest.raises(ValueError):
-        build(s.plan_clips([clip(), clip("b.mp4", w=1920, h=1080)], 15.0), "gpu")
+        build(s.plan_clips([clip(), clip("b.mp4", w=1920, h=1080)], 15.0), "gpu_overscan")
 
 
 def test_gpu_crop_for_960x512():
     plan = s.plan_clips([clip(w=960, h=512), clip("clip2.mp4", w=960, h=512)], 20.0)
-    assert "-crop 0x0x24x26" in " ".join(build(plan, "gpu"))
+    assert "-crop 0x0x24x26" in " ".join(build(plan, "gpu_overscan"))
 
 
 def test_gpu_upload_command_crops_on_cpu_then_scales_on_gpu():
@@ -140,8 +145,8 @@ def test_edge_defect_spots_a_green_bottom_line():
 def test_verify_routes_keeps_first_clean_gpu_route(tmp_path, monkeypatch):
     plan = s.ClipPlan([clip(w=960, h=512, dur=2.0)], Fraction(24), 48, 64, 36)
     attempts = s.clip_attempts(plan, "auto", GPU_CAPS)
-    frames = {"reference.mp4": yuv_frame(64, 36), "gpu.mp4": yuv_frame(64, 36, bottom_uv=0),
-              "gpu_upload.mp4": yuv_frame(64, 36)}
+    frames = {"reference_cpu_overscan.mp4": yuv_frame(64, 36), "reference_cpu.mp4": yuv_frame(64, 36),
+              "gpu_overscan.mp4": yuv_frame(64, 36, bottom_uv=0), "gpu_upload.mp4": yuv_frame(64, 36)}
     monkeypatch.setattr(s.subprocess, "run", lambda *a, **k: None)
     monkeypatch.setattr(s, "decode_frame", lambda path, i, w, h: frames[Path(path).name])
     kept = s.verify_routes(attempts, plan, tmp_path, Path("n.wav"), GPU_CAPS)
