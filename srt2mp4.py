@@ -10,10 +10,11 @@ Two backgrounds are supported:
 * Video clips (``--clips DIR``): every ``*.mp4`` in DIR is concatenated in
   natural filename order, center-cropped to 16:9, scaled to 1920x1080, and the
   cards (now transparent, with a black outline for readability) are overlaid on
-  top. The clips' own audio is dropped. On an NVIDIA GPU, decoding (NVDEC) and
-  encoding (NVENC) run on the GPU and crop/scale/overlay on all CPU cores;
-  without one, everything runs on the CPU. --gpu-filters moves the filters to
-  the GPU too (experimental: it can leave a green line at the bottom edge).
+  top. The clips' own audio is dropped. On an NVIDIA GPU, decoding (NVDEC),
+  scaling, overlay (CUDA) and encoding (NVENC) run on the GPU. Each GPU route is
+  first checked on one second of video against a CPU render, and skipped if it
+  leaves edge artifacts (some setups show a green line at the bottom); the
+  fallback does crop/scale/overlay on all CPU cores, then everything on the CPU.
   All clips are read through one concat demuxer input, so thousands of clips
   are fine. Clips that differ from the majority format are re-encoded to match,
   and a still of the last frame is appended if the clips run short.
@@ -364,6 +365,15 @@ class Caps:
     scale_cuda_opts: frozenset[str]
     gpu: bool
 
+    def cuda_filters(self) -> bool:
+        """CUDA scale/overlay plus an NVENC encoder (needed by both GPU filter routes)."""
+        return (
+            self.gpu
+            and {"scale_cuda", "overlay_cuda", "hwupload"} <= self.filters
+            and "format" in self.scale_cuda_opts
+            and any(e in self.encoders for e in NVENC_ENCODERS)
+        )
+
     def full_gpu(self, codec: str) -> bool:
         """Can the clip path run end to end on the GPU for clips of ``codec``?"""
         return (
@@ -602,6 +612,15 @@ def prepare_clips(clips: Sequence[ClipInfo], narration_seconds: float, work: Pat
     return prepared
 
 
+ROUTE_LABELS = {
+    "gpu": "full GPU",
+    "gpu_upload": "GPU decode/scale/overlay/encode, CPU crop",
+    "hybrid": "GPU decode/encode + CPU filters",
+    "cpu": "CPU",
+}
+GPU_ROUTES = ("gpu", "gpu_upload")
+
+
 def build_clip_command(
     plan: ClipPlan,
     mode: str,
@@ -613,10 +632,13 @@ def build_clip_command(
     caps: Caps | None = None,
 ) -> list[str]:
     """ffmpeg command for the clip-background video. The clips must share one format
-    (see ``prepare_clips``).
+    (see ``prepare_clips``). ``mode`` is one of:
 
-    ``mode`` is ``gpu`` (decode, crop, scale, overlay and encode on the GPU), ``hybrid``
-    (GPU decode and encode, CPU filters) or ``cpu``.
+    * ``gpu``: NVDEC decode with its built-in crop, CUDA scale and overlay, NVENC.
+    * ``gpu_upload``: NVDEC decode, crop on the CPU (just a pointer offset on the small
+      source frame), then CUDA scale and overlay and NVENC.
+    * ``hybrid``: NVDEC decode and NVENC encode, crop/scale/overlay on all CPU cores.
+    * ``cpu``: everything on the CPU.
     """
     if not plan.uniform:
         raise ValueError("Clips must share one format; run prepare_clips first.")
@@ -625,21 +647,26 @@ def build_clip_command(
     cw, ch, x, y = crop_box(first.width, first.height, w, h)
     clips_input = ["-f", "concat", "-safe", "0", "-i", str(clips_list)]
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "warning"]
+    # One shared CUDA device for the decoder and the filters (hwupload, overlay_cuda).
+    cuda_device = ["-init_hw_device", "cuda=gpu:0", "-filter_hw_device", "gpu"]
+    lanczos = ":interp_algo=lanczos" if caps is None or "interp_algo" in caps.scale_cuda_opts else ""
+    cuda_tail = (
+        f"scale_cuda=w={w}:h={h}{lanczos}:format=yuv420p[bg];"
+        f"[1:v]format=yuva420p,hwupload[subs];"
+        f"[bg][subs]overlay_cuda=x=0:y=0[v]"
+    )
 
     if mode == "gpu":
         crop = f"{y}x{first.height - ch - y}x{x}x{first.width - cw - x}"  # top x bottom x left x right
         cmd += [
-            # One shared CUDA device for the decoder and the filters (hwupload, overlay_cuda).
-            "-init_hw_device", "cuda=gpu:0", "-filter_hw_device", "gpu",
+            *cuda_device,
             "-hwaccel", "cuda", "-hwaccel_device", "gpu", "-hwaccel_output_format", "cuda",
             "-c:v", f"{first.codec}_cuvid", "-crop", crop, *clips_input,
         ]
-        lanczos = ":interp_algo=lanczos" if caps is None or "interp_algo" in caps.scale_cuda_opts else ""
-        graph = (
-            f"[0:v]scale_cuda=w={w}:h={h}{lanczos}:format=yuv420p[bg];"
-            f"[1:v]format=yuva420p,hwupload[subs];"
-            f"[bg][subs]overlay_cuda=x=0:y=0[v]"
-        )
+        graph = "[0:v]" + cuda_tail
+    elif mode == "gpu_upload":
+        cmd += [*cuda_device, "-hwaccel", "cuda", "-hwaccel_device", "gpu", *clips_input]
+        graph = f"[0:v]crop={cw}:{ch}:{x}:{y},format=nv12,hwupload," + cuda_tail
     else:
         # Crop, Lanczos scale and overlay are frame-parallel on the CPU, so use every core.
         cmd += ["-filter_complex_threads", str(os.cpu_count() or 1)]
@@ -662,13 +689,11 @@ def build_clip_command(
     return cmd
 
 
-def clip_attempts(plan: ClipPlan, encoder: str, caps: Caps, gpu_filters: bool = False) -> list[tuple[str, str]]:
-    """Ordered (mode, encoder) attempts; later ones are fallbacks.
-
-    The default is GPU decode and encode with crop, scale and overlay on the CPU.
-    The all-GPU filter chain (``gpu_filters``) is opt-in: on some setups it leaves a
-    green line along the bottom edge (the NVDEC crop or CUDA scaler sampling past
-    the picture), which the CPU filters never do."""
+def clip_attempts(
+    plan: ClipPlan, encoder: str, caps: Caps, cpu_filters: bool = False
+) -> list[tuple[str, str]]:
+    """Ordered (mode, encoder) attempts, fastest first; later ones are fallbacks.
+    GPU filter routes are checked against a CPU render before use (``verify_routes``)."""
     if encoder == "libx264":
         return [("cpu", "libx264")]
     if encoder == "auto":
@@ -676,12 +701,109 @@ def clip_attempts(plan: ClipPlan, encoder: str, caps: Caps, gpu_filters: bool = 
     else:
         nvencs = [encoder]
     attempts = []
-    if gpu_filters and nvencs and plan.uniform and caps.full_gpu(plan.clips[0].codec):
-        attempts += [("gpu", e) for e in nvencs]
+    if not cpu_filters and nvencs and plan.uniform and caps.cuda_filters():
+        if caps.full_gpu(plan.clips[0].codec):
+            attempts += [("gpu", e) for e in nvencs]
+        attempts += [("gpu_upload", e) for e in nvencs]
     attempts += [("hybrid", e) for e in nvencs]
     if encoder == "auto":
         attempts.append(("cpu", "libx264"))
     return attempts
+
+
+def decode_frame(path: Path, index: int, w: int, h: int) -> bytes:
+    """Frame ``index`` of ``path`` as raw yuv420p bytes, decoded on the CPU."""
+    out = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(path), "-vf", f"select=eq(n\\,{index})", "-frames:v", "1",
+         "-f", "rawvideo", "-pix_fmt", "yuv420p", "-"],
+        capture_output=True, check=True,
+    ).stdout
+    if len(out) != w * h * 3 // 2:
+        raise RuntimeError(f"Could not decode frame {index} of {path}")
+    return out
+
+
+def edge_defect(a: bytes, b: bytes, w: int, h: int) -> float:
+    """How much worse two yuv420p frames agree along their edges than in their interior
+    (mean absolute difference, 8-bit units). Different scalers agree to within a few
+    units everywhere; a green or garbage line at an edge shows up as a large excess."""
+    worst = 0.0
+    planes = [(0, w, h), (w * h, w // 2, h // 2), (w * h * 5 // 4, w // 2, h // 2)]
+    for off, pw, ph in planes:
+        def row(r: int) -> float:
+            s = off + r * pw
+            return sum(abs(p - q) for p, q in zip(a[s:s + pw], b[s:s + pw])) / pw
+
+        def col(c: int) -> float:
+            return sum(abs(a[off + r * pw + c] - b[off + r * pw + c]) for r in range(ph)) / ph
+
+        interior = sorted([row(ph * k // 10) for k in range(2, 9)] + [col(pw * k // 10) for k in range(2, 9)])
+        baseline = interior[len(interior) // 2]
+        edges = [row(0), row(1), row(ph - 2), row(ph - 1), col(0), col(1), col(pw - 2), col(pw - 1)]
+        worst = max(worst, max(edges) - baseline)
+    return worst
+
+
+EDGE_DEFECT_LIMIT = 20.0
+
+
+def verify_routes(
+    attempts: list[tuple[str, str]], plan: ClipPlan, work: Path, audio_path: Path, caps: Caps
+) -> list[tuple[str, str]]:
+    """Render one second of the first clip with each GPU filter route and compare it to
+    a CPU render. Routes that fail or leave edge artifacts (e.g. a green line along the
+    bottom) are dropped. Stops at the first good route; the rest are dropped too, so the
+    fallbacks are the CPU-filter routes, which are known to be clean."""
+    if not any(mode in GPU_ROUTES for mode, _ in attempts):
+        return attempts
+    first = plan.clips[0]
+    frames = max(1, min(round(plan.fps), int(first.duration * float(plan.fps))))
+    probe = ClipPlan([first], plan.fps, frames, plan.out_w, plan.out_h)
+    vdir = work / "verify"
+    vdir.mkdir(parents=True, exist_ok=True)
+    clips_list, cards_list = vdir / "clips.txt", vdir / "cards.txt"
+    clips_list.write_text("ffconcat version 1.0\n" + concat_line(first.path.resolve()), encoding="utf-8")
+    blank = vdir / "blank.png"
+    Image.new("RGBA", (plan.out_w, plan.out_h), (0, 0, 0, 0)).save(blank)
+    cards_list.write_text(
+        "ffconcat version 1.0\n" + concat_line(blank) + f"duration {probe.duration:.6f}\n" + concat_line(blank),
+        encoding="utf-8",
+    )
+    index = frames // 2
+
+    def render(mode: str, enc: str, name: str) -> bytes:
+        out = vdir / name
+        cmd = build_clip_command(probe, mode, enc, clips_list, cards_list, audio_path, out, caps)
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        return decode_frame(out, index, plan.out_w, plan.out_h)
+
+    print("Checking the GPU routes against a CPU render of the first clip", flush=True)
+    try:
+        reference = render("cpu", "libx264", "reference.mp4")
+    except (subprocess.CalledProcessError, RuntimeError) as e:
+        print(f"  could not make the CPU reference ({e}); using the CPU-filter routes", flush=True)
+        return [a for a in attempts if a[0] not in GPU_ROUTES]
+
+    verdicts: dict[str, bool] = {}
+    for mode, enc in attempts:
+        if mode not in GPU_ROUTES or mode in verdicts or any(verdicts.values()):
+            continue
+        label = ROUTE_LABELS[mode]
+        try:
+            defect = edge_defect(render(mode, enc, f"{mode}.mp4"), reference, plan.out_w, plan.out_h)
+        except subprocess.CalledProcessError as e:
+            tail = " | ".join((e.stderr or "").strip().splitlines()[-2:])
+            print(f"  {label}: not available ({tail or 'ffmpeg failed'})", flush=True)
+            verdicts[mode] = False
+            continue
+        except RuntimeError as e:
+            print(f"  {label}: {e}", flush=True)
+            verdicts[mode] = False
+            continue
+        verdicts[mode] = defect <= EDGE_DEFECT_LIMIT
+        print(f"  {label}: {'OK' if verdicts[mode] else 'edge artifact, skipping'} (edge score {defect:.1f})",
+              flush=True)
+    return [a for a in attempts if a[0] not in GPU_ROUTES or verdicts.get(a[0])]
 
 
 def render_clip_video(
@@ -693,7 +815,7 @@ def render_clip_video(
     work: Path | None = None,
     style: Style = VIDEO_STYLE,
     probe_cache: Path | None = None,
-    gpu_filters: bool = False,
+    cpu_filters: bool = False,
 ) -> Path:
     clip_paths = find_clips(clips)
     infos = probe_clips(clip_paths, probe_cache)
@@ -721,11 +843,12 @@ def render_clip_video(
             for clip in prepared:
                 fh.write(concat_line(clip.path.resolve()))
 
-        attempts = clip_attempts(plan, encoder, caps, gpu_filters)
+        attempts = clip_attempts(plan, encoder, caps, cpu_filters)
+        attempts = verify_routes(attempts, plan, work, audio_path, caps)
         if not attempts:
             raise RuntimeError(f"Encoder {encoder} is not usable here.")
         for n, (mode, enc) in enumerate(attempts, 1):
-            label = {"gpu": "full GPU", "hybrid": "GPU decode/encode + CPU filters", "cpu": "CPU"}[mode]
+            label = ROUTE_LABELS[mode]
             print(f"Encoding MP4 with {enc} ({label})", flush=True)
             cmd = build_clip_command(plan, mode, enc, clips_list, cards_list, audio_path, output_path, caps)
             try:
@@ -750,7 +873,7 @@ def render_video(
     style: Style | None = None,
     background_clips: Path | Sequence[Path] | None = None,
     probe_cache: Path | None = None,
-    gpu_filters: bool = False,
+    cpu_filters: bool = False,
 ) -> Path:
     """Render cues over the audio of ``audio_path`` (audio or video) into ``output_path``.
 
@@ -765,7 +888,7 @@ def render_video(
     if background_clips is not None:
         return render_clip_video(
             cues, audio_path, output_path, background_clips, encoder, frames_dir, style or VIDEO_STYLE, probe_cache,
-            gpu_filters,
+            cpu_filters,
         )
 
     style = style or STYLE
@@ -813,8 +936,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("output", type=Path, nargs="?", help="Defaults to the .srt path with an .mp4 extension.")
     ap.add_argument("--clips", type=Path, help="Directory of .mp4 clips to use as the background.")
     ap.add_argument(
-        "--gpu-filters", action="store_true",
-        help="Crop, scale and overlay on the GPU too (experimental; may leave a green edge line).",
+        "--cpu-filters", action="store_true",
+        help="Skip the GPU filter routes: crop, scale and overlay on the CPU (GPU still decodes/encodes).",
     )
     ap.add_argument(
         "--encoder", choices=ENCODERS, default="auto",
@@ -833,7 +956,7 @@ def main(argv: list[str] | None = None) -> int:
     cues = parse_srt(args.srt)
     output = render_video(
         cues, args.audio, args.output or args.srt.with_suffix(".mp4"), args.encoder, args.keep_frames,
-        background_clips=args.clips, gpu_filters=args.gpu_filters,
+        background_clips=args.clips, cpu_filters=args.cpu_filters,
     )
     print(f"Wrote {output}")
     return 0

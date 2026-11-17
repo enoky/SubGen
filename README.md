@@ -113,12 +113,14 @@ uv run python -m srt2mp4 subtitles.srt narration.wav out.mp4 --clips path\to\cli
 - The encoding is tuned for YouTube 1080p uploads: HEVC (NVENC) quality-targeted VBR
   averaging around 10 Mbps, a keyframe every 2 seconds, BT.709 tags, AAC-LC 48 kHz
   stereo at 384 kbps, and `+faststart`.
-- On an NVIDIA GPU, decoding (NVDEC) and encoding (NVENC) run on the GPU, and the
-  crop, Lanczos scale and subtitle overlay run on all CPU cores; without a GPU it
-  falls back to libx264 on the CPU. `--gpu-filters` moves crop/scale/overlay to the
-  GPU too (`scale_cuda`, `overlay_cuda`). It is experimental: on some setups it
-  leaves a thin green line along the bottom edge. Run
-  `uv run python -m srt2mp4 --check` to see what your ffmpeg supports.
+- On an NVIDIA GPU, decoding (NVDEC), scaling and the subtitle overlay (CUDA) and
+  encoding (NVENC) all run on the GPU. Before the full encode, each GPU route renders
+  one second of the first clip and its edges are compared with a CPU render; a route
+  that leaves artifacts (some setups show a thin green line along the bottom) is
+  skipped. The fallback keeps GPU decode and encode with crop/scale/overlay on all
+  CPU cores (about 3x slower), then libx264 on the CPU. `--cpu-filters` goes straight
+  to that fallback. Run `uv run python -m srt2mp4 --check` to see what your ffmpeg
+  supports.
 
 ## Web Interface
 

@@ -57,19 +57,20 @@ def test_majority_signature_ignores_odd_clip():
     assert s.majority_signature(clips) == ("h264", 1280, 704, Fraction(24), "yuv420p")
 
 
-def test_default_attempts_use_cpu_filters_on_gpu():
+def test_attempt_order_on_gpu():
     plan = s.plan_clips([clip(), clip("clip2.mp4")], 20.0)
     assert s.clip_attempts(plan, "auto", GPU_CAPS) == [
-        ("hybrid", "hevc_nvenc"), ("hybrid", "h264_nvenc"), ("cpu", "libx264"),
+        ("gpu", "hevc_nvenc"), ("gpu", "h264_nvenc"),
+        ("gpu_upload", "hevc_nvenc"), ("gpu_upload", "h264_nvenc"),
+        ("hybrid", "hevc_nvenc"), ("hybrid", "h264_nvenc"),
+        ("cpu", "libx264"),
     ]
 
 
-def test_attempt_order_with_gpu_filters():
-    plan = s.plan_clips([clip(), clip("clip2.mp4")], 20.0)
-    assert s.clip_attempts(plan, "auto", GPU_CAPS, gpu_filters=True) == [
-        ("gpu", "hevc_nvenc"), ("gpu", "h264_nvenc"),
-        ("hybrid", "hevc_nvenc"), ("hybrid", "h264_nvenc"),
-        ("cpu", "libx264"),
+def test_cpu_filters_skips_gpu_routes():
+    plan = s.plan_clips([clip()], 20.0)
+    assert s.clip_attempts(plan, "auto", GPU_CAPS, cpu_filters=True) == [
+        ("hybrid", "hevc_nvenc"), ("hybrid", "h264_nvenc"), ("cpu", "libx264"),
     ]
 
 
@@ -103,6 +104,61 @@ def test_command_rejects_mixed_clips():
 def test_gpu_crop_for_960x512():
     plan = s.plan_clips([clip(w=960, h=512), clip("clip2.mp4", w=960, h=512)], 20.0)
     assert "-crop 0x0x24x26" in " ".join(build(plan, "gpu"))
+
+
+def test_gpu_upload_command_crops_on_cpu_then_scales_on_gpu():
+    cmd = build(s.plan_clips([clip(w=960, h=512)], 12.0), "gpu_upload")
+    graph = cmd[cmd.index("-filter_complex") + 1]
+    assert "-crop" not in cmd and "h264_cuvid" not in cmd
+    assert "-hwaccel_output_format" not in cmd  # decoded frames come back for the cheap crop
+    assert graph.startswith("[0:v]crop=910:512:24:0,format=nv12,hwupload,scale_cuda=w=1920:h=1080")
+    assert "overlay_cuda" in graph
+
+
+def yuv_frame(w, h, y=100, u=120, v=130, bottom_uv=None):
+    luma = bytes([y]) * (w * h)
+    cw, ch = w // 2, h // 2
+
+    def plane(val):
+        rows = [bytes([val]) * cw for _ in range(ch)]
+        if bottom_uv is not None:
+            rows[-1] = bytes([bottom_uv]) * cw
+        return b"".join(rows)
+
+    return luma + plane(u) + plane(v)
+
+
+def test_edge_defect_spots_a_green_bottom_line():
+    w, h = 64, 36
+    ref = yuv_frame(w, h)
+    assert s.edge_defect(ref, ref, w, h) == 0
+    assert s.edge_defect(yuv_frame(w, h, u=123), ref, w, h) == 0  # uniform small difference is fine
+    green = yuv_frame(w, h, bottom_uv=0)  # zeroed chroma shows as green
+    assert s.edge_defect(green, ref, w, h) > s.EDGE_DEFECT_LIMIT
+
+
+def test_verify_routes_keeps_first_clean_gpu_route(tmp_path, monkeypatch):
+    plan = s.ClipPlan([clip(w=960, h=512, dur=2.0)], Fraction(24), 48, 64, 36)
+    attempts = s.clip_attempts(plan, "auto", GPU_CAPS)
+    frames = {"reference.mp4": yuv_frame(64, 36), "gpu.mp4": yuv_frame(64, 36, bottom_uv=0),
+              "gpu_upload.mp4": yuv_frame(64, 36)}
+    monkeypatch.setattr(s.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(s, "decode_frame", lambda path, i, w, h: frames[Path(path).name])
+    kept = s.verify_routes(attempts, plan, tmp_path, Path("n.wav"), GPU_CAPS)
+    assert kept == [
+        ("gpu_upload", "hevc_nvenc"), ("gpu_upload", "h264_nvenc"),
+        ("hybrid", "hevc_nvenc"), ("hybrid", "h264_nvenc"), ("cpu", "libx264"),
+    ]
+
+
+def test_verify_routes_falls_back_to_cpu_filters(tmp_path, monkeypatch):
+    plan = s.ClipPlan([clip(dur=2.0)], Fraction(24), 48, 64, 36)
+    attempts = s.clip_attempts(plan, "auto", GPU_CAPS)
+    bad = yuv_frame(64, 36, bottom_uv=0)
+    monkeypatch.setattr(s.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(s, "decode_frame", lambda path, i, w, h: yuv_frame(64, 36) if "reference" in str(path) else bad)
+    kept = s.verify_routes(attempts, plan, tmp_path, Path("n.wav"), GPU_CAPS)
+    assert [m for m, _ in kept] == ["hybrid", "hybrid", "cpu"]
 
 
 def test_hybrid_command_crops():

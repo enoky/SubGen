@@ -92,8 +92,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Copy clips to local disk (in parallel) before encoding instead of reading them from Drive.",
     )
     ap.add_argument(
-        "--gpu-filters", action="store_true",
-        help="Crop/scale/overlay on the GPU too (experimental; may leave a green line at the bottom).",
+        "--cpu-filters", action="store_true",
+        help="Skip the GPU filter routes (crop/scale/overlay on the CPU; slower, GPU still decodes/encodes).",
     )
     ap.add_argument("--no-normalize", action="store_true", help="Skip loudness normalization of the narration.")
     ap.add_argument(
@@ -179,7 +179,7 @@ def main(argv: list[str] | None = None) -> int:
         if not args.srt_only:
             srt2mp4.render_video(
                 srt2mp4.parse_srt(srt_path), audio, mp4_path, encoder=args.encoder, background_clips=clips,
-                probe_cache=out_dir / ".clip_info_cache.json", gpu_filters=args.gpu_filters,
+                probe_cache=out_dir / ".clip_info_cache.json", cpu_filters=args.cpu_filters,
             )
             print(f"Copying video to {out_dir / mp4_name}", flush=True)
             shutil.copyfile(mp4_path, out_dir / mp4_name)
