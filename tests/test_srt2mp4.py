@@ -57,9 +57,16 @@ def test_majority_signature_ignores_odd_clip():
     assert s.majority_signature(clips) == ("h264", 1280, 704, Fraction(24), "yuv420p")
 
 
-def test_attempt_order_on_gpu():
+def test_default_attempts_use_cpu_filters_on_gpu():
     plan = s.plan_clips([clip(), clip("clip2.mp4")], 20.0)
     assert s.clip_attempts(plan, "auto", GPU_CAPS) == [
+        ("hybrid", "hevc_nvenc"), ("hybrid", "h264_nvenc"), ("cpu", "libx264"),
+    ]
+
+
+def test_attempt_order_with_gpu_filters():
+    plan = s.plan_clips([clip(), clip("clip2.mp4")], 20.0)
+    assert s.clip_attempts(plan, "auto", GPU_CAPS, gpu_filters=True) == [
         ("gpu", "hevc_nvenc"), ("gpu", "h264_nvenc"),
         ("hybrid", "hevc_nvenc"), ("hybrid", "h264_nvenc"),
         ("cpu", "libx264"),
@@ -101,7 +108,8 @@ def test_gpu_crop_for_960x512():
 def test_hybrid_command_crops():
     cmd = build(s.plan_clips([clip()], 12.0), "hybrid")
     graph = cmd[cmd.index("-filter_complex") + 1]
-    assert "-hwaccel" in cmd
+    assert "-hwaccel" in cmd and "-hwaccel_output_format" not in cmd  # frames come back to the CPU
+    assert "-filter_complex_threads" in cmd
     assert "crop=1252:704:14:0,scale=1920:1080:flags=lanczos" in graph
 
 
