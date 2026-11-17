@@ -25,6 +25,7 @@ Usage (Colab, after mounting Drive):
     !python -m drive_pipeline --lufs -16                 # different loudness target
     !python -m drive_pipeline --no-normalize             # use narration.wav as is
     !python -m drive_pipeline --copy-clips               # copy clips locally before encoding
+    !python -m drive_pipeline --check-routes             # just check which video route works (~1 min)
 """
 
 from __future__ import annotations
@@ -92,6 +93,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Copy clips to local disk (in parallel) before encoding instead of reading them from Drive.",
     )
     ap.add_argument(
+        "--check-routes", action="store_true",
+        help="Only check which video route works on this machine (about a minute), then stop.",
+    )
+    ap.add_argument(
         "--cpu-filters", action="store_true",
         help="Skip the GPU filter routes (crop/scale/overlay on the CPU; slower, GPU still decodes/encodes).",
     )
@@ -147,6 +152,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         print(f"Copying narration from {root} to {work}", flush=True)
         audio = copy_in(audio_src, work / "input")
+        if args.check_routes:
+            srt2mp4.render_clip_video(
+                [], audio, local_out / "route_check.mp4", clips_src, encoder=args.encoder,
+                work=work / "route_check", probe_cache=out_dir / ".clip_info_cache.json",
+                cpu_filters=args.cpu_filters, check_only=True,
+            )
+            return 0
         if not args.no_normalize:
             print(f"Normalizing narration to {args.lufs:g} LUFS, {args.true_peak:g} dBTP", flush=True)
             normalized = audio.with_name(f"{audio.stem}{normalize_audio.SUFFIX}.wav")

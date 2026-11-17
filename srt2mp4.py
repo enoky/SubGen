@@ -614,12 +614,13 @@ def prepare_clips(clips: Sequence[ClipInfo], narration_seconds: float, work: Pat
 
 ROUTE_LABELS = {
     "gpu_overscan": "GPU decode/scale/overlay/encode, 1.5% overscan",
+    "gpu_overscan_canvas": "GPU decode/scale/overlay/encode, 1.5% overscan on an uploaded canvas",
     "gpu_overscan_download": "GPU decode/scale/overlay/encode, 1.5% overscan cropped on the CPU",
     "gpu_upload": "GPU decode/scale/overlay/encode, CPU crop",
     "hybrid": "GPU decode/encode + CPU filters",
     "cpu": "CPU",
 }
-GPU_ROUTES = ("gpu_overscan", "gpu_overscan_download", "gpu_upload")
+GPU_ROUTES = ("gpu_overscan", "gpu_overscan_canvas", "gpu_overscan_download", "gpu_upload")
 # The overscan route renders this many extra pixels on each side and crops them off,
 # so anything the GPU decoder or scaler leaves along the frame edges (e.g. a thin green
 # line at the bottom) is discarded. 8 output rows cover ~4 source rows at 2x upscaling.
@@ -644,6 +645,8 @@ def build_clip_command(
       overlaying the oversized frame at a negative offset onto a 1920x1080 canvas
       (made by a cheap second scale of the same frame, which it fully covers). Frames
       never leave the GPU, so decode, filters and NVENC overlap.
+    * ``gpu_overscan_canvas``: the same, but the canvas is one black frame uploaded
+      once and repeated by the loop filter, instead of a split and second scale.
     * ``gpu_overscan_download``: the same, but the border is cropped on the CPU after
       a GPU-to-CPU copy. That copy waits for the GPU on every frame (~2x slower), so
       it is only a fallback.
@@ -668,7 +671,8 @@ def build_clip_command(
         f"[bg][subs]overlay_cuda=x=0:y=0[v]"
     )
 
-    if mode in ("gpu_overscan", "gpu_overscan_download"):
+    extra_inputs: list[str] = []
+    if mode in ("gpu_overscan", "gpu_overscan_canvas", "gpu_overscan_download"):
         crop = f"{y}x{first.height - ch - y}x{x}x{first.width - cw - x}"  # top x bottom x left x right
         cmd += [
             *cuda_device,
@@ -684,6 +688,16 @@ def build_clip_command(
                 f"[a]scale_cuda=w={w}:h={h}{nearest}:format=yuv420p[canvas];"
                 f"[b]{big}[big];"
                 f"[canvas][big]overlay_cuda=x={-mx}:y={-my}[bg];"
+                f"[1:v]format=yuva420p,hwupload[subs];"
+                f"[bg][subs]overlay_cuda=x=0:y=0[v]"
+            )
+        elif mode == "gpu_overscan_canvas":
+            # Input 3: a single black frame, uploaded once and repeated on the GPU.
+            extra_inputs = ["-f", "lavfi", "-i", f"color=c=black:s={w}x{h}:r={fps_arg(fps)}:d={1 / float(fps):.6f}"]
+            graph = (
+                f"[3:v]format=yuv420p,hwupload,loop=loop=-1:size=1[canvas];"
+                f"[0:v]{big}[big];"
+                f"[canvas][big]overlay_cuda=x={-mx}:y={-my}:shortest=1[bg];"
                 f"[1:v]format=yuva420p,hwupload[subs];"
                 f"[bg][subs]overlay_cuda=x=0:y=0[v]"
             )
@@ -717,6 +731,7 @@ def build_clip_command(
     cmd += [
         "-f", "concat", "-safe", "0", "-i", str(cards_list),
         "-i", str(audio_path),
+        *extra_inputs,
         "-filter_complex", graph,
         "-map", "[v]", "-map", "2:a:0",
         "-r", fps_arg(fps), "-fps_mode", "cfr",
@@ -748,6 +763,7 @@ def clip_attempts(
     if not cpu_filters and nvencs and plan.uniform and caps.cuda_filters():
         if caps.full_gpu(plan.clips[0].codec):
             attempts += [("gpu_overscan", e) for e in nvencs]
+            attempts += [("gpu_overscan_canvas", e) for e in nvencs]
             if "hwdownload" in caps.filters:
                 attempts += [("gpu_overscan_download", e) for e in nvencs]
         attempts += [("gpu_upload", e) for e in nvencs]
@@ -755,6 +771,19 @@ def clip_attempts(
     if encoder == "auto":
         attempts.append(("cpu", "libx264"))
     return attempts
+
+
+def count_frames(path: Path) -> str:
+    """Decoded video frame count of ``path`` (as text, '?' if it can't be read)."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+             "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        return out or "0"
+    except (OSError, subprocess.CalledProcessError):
+        return "?"
 
 
 def decode_frame(path: Path, index: int, w: int, h: int) -> bytes:
@@ -820,8 +849,14 @@ def verify_routes(
     def render(mode: str, enc: str, name: str) -> bytes:
         out = vdir / name
         cmd = build_clip_command(probe, mode, enc, clips_list, cards_list, audio_path, out, caps)
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-        return decode_frame(out, index, plan.out_w, plan.out_h)
+        proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        try:
+            return decode_frame(out, index, plan.out_w, plan.out_h)
+        except (RuntimeError, subprocess.CalledProcessError) as e:
+            said = " | ".join((proc.stderr or "").strip().splitlines()[-4:]) or "no warnings"
+            raise RuntimeError(
+                f"rendered {count_frames(out)} of {frames} frames; ffmpeg said: {said}"
+            ) from e
 
     print("Checking the GPU routes against a CPU render of the first clip", flush=True)
     references: dict[str, bytes] = {}
@@ -871,7 +906,10 @@ def render_clip_video(
     style: Style = VIDEO_STYLE,
     probe_cache: Path | None = None,
     cpu_filters: bool = False,
+    check_only: bool = False,
 ) -> Path:
+    """Render ``cues`` over the clips. ``check_only`` stops after choosing the route
+    (probing the clips and checking the GPU routes), without encoding."""
     clip_paths = find_clips(clips)
     infos = probe_clips(clip_paths, probe_cache)
     narration = media_duration(audio_path)
@@ -889,6 +927,15 @@ def render_clip_video(
         work.mkdir(parents=True, exist_ok=True)
         prepared = prepare_clips(infos, narration, work, caps)
         plan = plan_clips(prepared, narration, style)
+        attempts = clip_attempts(plan, encoder, caps, cpu_filters)
+        attempts = verify_routes(attempts, plan, work, audio_path, caps)
+        if not attempts:
+            raise RuntimeError(f"Encoder {encoder} is not usable here.")
+        if check_only:
+            mode, enc = attempts[0]
+            print(f"Would encode with {enc} ({ROUTE_LABELS[mode]})", flush=True)
+            return output_path
+
         cards_list, _ = build_card_timeline(
             cues, plan.fps, narration, work, lambda text: render_card(text, font, style, transparent=True)
         )
@@ -898,10 +945,6 @@ def render_clip_video(
             for clip in prepared:
                 fh.write(concat_line(clip.path.resolve()))
 
-        attempts = clip_attempts(plan, encoder, caps, cpu_filters)
-        attempts = verify_routes(attempts, plan, work, audio_path, caps)
-        if not attempts:
-            raise RuntimeError(f"Encoder {encoder} is not usable here.")
         for n, (mode, enc) in enumerate(attempts, 1):
             label = ROUTE_LABELS[mode]
             print(f"Encoding MP4 with {enc} ({label})", flush=True)
