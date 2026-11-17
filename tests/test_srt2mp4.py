@@ -61,6 +61,7 @@ def test_attempt_order_on_gpu():
     plan = s.plan_clips([clip(), clip("clip2.mp4")], 20.0)
     assert s.clip_attempts(plan, "auto", GPU_CAPS) == [
         ("gpu_overscan", "hevc_nvenc"), ("gpu_overscan", "h264_nvenc"),
+        ("gpu_overscan_canvas", "hevc_nvenc"), ("gpu_overscan_canvas", "h264_nvenc"),
         ("gpu_overscan_download", "hevc_nvenc"), ("gpu_overscan_download", "h264_nvenc"),
         ("gpu_upload", "hevc_nvenc"), ("gpu_upload", "h264_nvenc"),
         ("hybrid", "hevc_nvenc"), ("hybrid", "h264_nvenc"),
@@ -100,6 +101,17 @@ def test_gpu_overscan_command():
     assert "-tag:v hvc1" in joined and "-movflags +faststart" in joined
     assert "-g 48" in joined and "-b:a 384k" in joined and "-ar 48000" in joined
     assert joined.count("-i ") == 3  # clips list, cards list, narration: never one input per clip
+
+
+def test_gpu_overscan_canvas_uploads_one_frame():
+    cmd = build(s.plan_clips([clip()], 20.0), "gpu_overscan_canvas")
+    graph = cmd[cmd.index("-filter_complex") + 1]
+    lavfi = cmd[cmd.index("lavfi") + 2]
+    assert lavfi.startswith("color=c=black:s=1920x1080:r=24:d=0.041667")
+    assert cmd[cmd.index("-map") + 3] == "2:a:0"  # the canvas input comes after the narration
+    assert "[3:v]format=yuv420p,hwupload,loop=loop=-1:size=1[canvas]" in graph
+    assert "[canvas][big]overlay_cuda=x=-14:y=-8:shortest=1[bg]" in graph
+    assert "hwdownload" not in graph and "split" not in graph
 
 
 def test_gpu_overscan_download_fallback_crops_on_cpu():
@@ -158,6 +170,7 @@ def test_verify_routes_keeps_first_clean_gpu_route(tmp_path, monkeypatch):
     attempts = s.clip_attempts(plan, "auto", GPU_CAPS)
     frames = {"reference_cpu_overscan.mp4": yuv_frame(64, 36), "reference_cpu.mp4": yuv_frame(64, 36),
               "gpu_overscan.mp4": yuv_frame(64, 36, bottom_uv=0),
+              "gpu_overscan_canvas.mp4": yuv_frame(64, 36, bottom_uv=0),
               "gpu_overscan_download.mp4": yuv_frame(64, 36, bottom_uv=0), "gpu_upload.mp4": yuv_frame(64, 36)}
     monkeypatch.setattr(s.subprocess, "run", lambda *a, **k: None)
     monkeypatch.setattr(s, "decode_frame", lambda path, i, w, h: frames[Path(path).name])

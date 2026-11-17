@@ -153,6 +153,8 @@ the Colab machine first, so reading overlaps with GPU work. Clip details are cac
 `output/.clip_info_cache.json`, so reruns over the same clips start right away. If
 streaming from Drive turns out slow, `--copy-clips` copies them to local disk first
 (in parallel; clips already copied earlier in the session are skipped).
+`--check-routes` only checks which video route works on this machine (about a
+minute) and stops, without transcribing or encoding.
 
 Before transcription, the narration is loudness-normalized for YouTube: two-pass
 EBU R128 to -14 LUFS integrated and -1.5 dBTP true peak, saved as 48 kHz 24-bit WAV.
