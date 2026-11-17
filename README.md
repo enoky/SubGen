@@ -102,7 +102,8 @@ uv run python -m srt2mp4 subtitles.srt narration.wav out.mp4 --clips path\to\cli
 
 - The clips are joined in natural filename order (`clip2` before `clip10`), then
   center-cropped to 16:9 and scaled to 1920x1080 with Lanczos. For example,
-  1280x704 is cropped by 14 px on each side, then scaled. Their audio is dropped.
+  1280x704 is cropped by 14 px on each side and 960x512 by about 25 px (offsets are
+  kept even for 4:2:0 video and the GPU decoder), then scaled. Their audio is dropped.
 - The output uses the clips' frame rate. If the clips are shorter than the
   narration, the last frame is held; if longer, they are cut to the narration's length.
 - Thousands of clips are fine: they are checked in parallel and read through a single

@@ -336,8 +336,8 @@ def probe_clips(paths: Sequence[Path], cache_path: Path | None = None, workers: 
 def crop_box(width: int, height: int, out_w: int = 1920, out_h: int = 1080) -> tuple[int, int, int, int]:
     """Largest centered crop of ``width``x``height`` with the output's aspect ratio.
 
-    Returns ``(crop_w, crop_h, x, y)`` with even sizes (needed for 4:2:0 video).
-    1280x704 -> (1252, 704, 14, 0), which then scales exactly to 1920x1080.
+    Returns ``(crop_w, crop_h, x, y)`` with even sizes and offsets (4:2:0 chroma and
+    NVDEC's crop need them). 1280x704 -> (1252, 704, 14, 0); 960x512 -> (910, 512, 24, 0).
     """
     target = Fraction(out_w, out_h)
     if Fraction(width, height) > target:
@@ -345,7 +345,7 @@ def crop_box(width: int, height: int, out_w: int = 1920, out_h: int = 1080) -> t
     else:
         cw, ch = width, 2 * round(width / target / 2)
     cw, ch = min(cw, width), min(ch, height)
-    return cw, ch, (width - cw) // 2, (height - ch) // 2
+    return cw, ch, (width - cw) // 4 * 2, (height - ch) // 4 * 2
 
 
 def fps_arg(fps: Fraction) -> str:

@@ -35,6 +35,7 @@ def test_find_clips_empty_dir(tmp_path):
     ("size", "box"),
     [
         ((1280, 704), (1252, 704, 14, 0)),  # slightly wider than 16:9: trim the sides
+        ((960, 512), (910, 512, 24, 0)),  # odd margin (25 px) rounded to an even offset
         ((1920, 1080), (1920, 1080, 0, 0)),  # already 16:9
         ((1080, 1080), (1080, 608, 0, 236)),  # taller: trim top and bottom
     ],
@@ -90,6 +91,11 @@ def test_gpu_command():
 def test_command_rejects_mixed_clips():
     with pytest.raises(ValueError):
         build(s.plan_clips([clip(), clip("b.mp4", w=1920, h=1080)], 15.0), "gpu")
+
+
+def test_gpu_crop_for_960x512():
+    plan = s.plan_clips([clip(w=960, h=512), clip("clip2.mp4", w=960, h=512)], 20.0)
+    assert "-crop 0x0x24x26" in " ".join(build(plan, "gpu"))
 
 
 def test_hybrid_command_crops():
