@@ -114,10 +114,10 @@ uv run python -m srt2mp4 subtitles.srt narration.wav out.mp4 --clips path\to\cli
   averaging around 10 Mbps, a keyframe every 2 seconds, BT.709 tags, AAC-LC 48 kHz
   stereo at 384 kbps, and `+faststart`.
 - On an NVIDIA GPU, decoding (NVDEC), scaling and the subtitle overlay (CUDA) and
-  encoding (NVENC) all run on the GPU. The GPU scales 1.5% larger than 1080p and the
-  extra 8 px border is cropped off, so anything the GPU decoder or scaler leaves along
-  the frame edges (some setups produce a thin green line at the bottom) never reaches
-  the video. As insurance, each GPU route first renders one second of the first clip
+  encoding (NVENC) all run on the GPU, and frames never leave it. The GPU scales 1.5%
+  larger than 1080p and the extra 8 px border is cut off on the GPU, so anything the
+  GPU decoder or scaler leaves along the frame edges (some setups produce a thin green
+  line at the bottom) never reaches the video. As insurance, each GPU route first renders one second of the first clip
   and its edges are compared with a CPU render; a route that leaves artifacts is
   skipped. The fallback keeps GPU decode and encode with crop/scale/overlay on all CPU
   cores (about 3x slower), then libx264 on the CPU. `--cpu-filters` goes straight to

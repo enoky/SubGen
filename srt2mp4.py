@@ -614,11 +614,12 @@ def prepare_clips(clips: Sequence[ClipInfo], narration_seconds: float, work: Pat
 
 ROUTE_LABELS = {
     "gpu_overscan": "GPU decode/scale/overlay/encode, 1.5% overscan",
+    "gpu_overscan_download": "GPU decode/scale/overlay/encode, 1.5% overscan cropped on the CPU",
     "gpu_upload": "GPU decode/scale/overlay/encode, CPU crop",
     "hybrid": "GPU decode/encode + CPU filters",
     "cpu": "CPU",
 }
-GPU_ROUTES = ("gpu_overscan", "gpu_upload")
+GPU_ROUTES = ("gpu_overscan", "gpu_overscan_download", "gpu_upload")
 # The overscan route renders this many extra pixels on each side and crops them off,
 # so anything the GPU decoder or scaler leaves along the frame edges (e.g. a thin green
 # line at the bottom) is discarded. 8 output rows cover ~4 source rows at 2x upscaling.
@@ -639,8 +640,13 @@ def build_clip_command(
     (see ``prepare_clips``). ``mode`` is one of:
 
     * ``gpu_overscan``: NVDEC decode with its built-in crop, CUDA scale to slightly
-      larger than the output and overlay, then the extra border is cropped off on the
-      CPU (free) and NVENC encodes from system memory.
+      larger than the output, then the extra border is cut off on the GPU by
+      overlaying the oversized frame at a negative offset onto a 1920x1080 canvas
+      (made by a cheap second scale of the same frame, which it fully covers). Frames
+      never leave the GPU, so decode, filters and NVENC overlap.
+    * ``gpu_overscan_download``: the same, but the border is cropped on the CPU after
+      a GPU-to-CPU copy. That copy waits for the GPU on every frame (~2x slower), so
+      it is only a fallback.
     * ``gpu_upload``: NVDEC decode, crop on the CPU (just a pointer offset on the small
       source frame), then CUDA scale and overlay and NVENC.
     * ``hybrid``: NVDEC decode and NVENC encode, crop/scale/overlay on all CPU cores.
@@ -662,7 +668,7 @@ def build_clip_command(
         f"[bg][subs]overlay_cuda=x=0:y=0[v]"
     )
 
-    if mode == "gpu_overscan":
+    if mode in ("gpu_overscan", "gpu_overscan_download"):
         crop = f"{y}x{first.height - ch - y}x{x}x{first.width - cw - x}"  # top x bottom x left x right
         cmd += [
             *cuda_device,
@@ -670,11 +676,23 @@ def build_clip_command(
             "-c:v", f"{first.codec}_cuvid", "-crop", crop, *clips_input,
         ]
         mx, my = overscan_margins(w, h)
-        graph = (
-            f"[0:v]scale_cuda=w={w + 2 * mx}:h={h + 2 * my}{lanczos}:format=yuv420p[big];"
-            f"[1:v]format=yuva420p,hwupload[subs];"
-            f"[big][subs]overlay_cuda=x={mx}:y={my},hwdownload,format=yuv420p,crop={w}:{h}:{mx}:{my}[v]"
-        )
+        big = f"scale_cuda=w={w + 2 * mx}:h={h + 2 * my}{lanczos}:format=yuv420p"
+        if mode == "gpu_overscan":
+            nearest = ":interp_algo=nearest" if lanczos else ""
+            graph = (
+                f"[0:v]split=2[a][b];"
+                f"[a]scale_cuda=w={w}:h={h}{nearest}:format=yuv420p[canvas];"
+                f"[b]{big}[big];"
+                f"[canvas][big]overlay_cuda=x={-mx}:y={-my}[bg];"
+                f"[1:v]format=yuva420p,hwupload[subs];"
+                f"[bg][subs]overlay_cuda=x=0:y=0[v]"
+            )
+        else:
+            graph = (
+                f"[0:v]{big}[big];"
+                f"[1:v]format=yuva420p,hwupload[subs];"
+                f"[big][subs]overlay_cuda=x={mx}:y={my},hwdownload,format=yuv420p,crop={w}:{h}:{mx}:{my}[v]"
+            )
     elif mode == "gpu_upload":
         cmd += [*cuda_device, "-hwaccel", "cuda", "-hwaccel_device", "gpu", *clips_input]
         graph = f"[0:v]crop={cw}:{ch}:{x}:{y},format=nv12,hwupload," + cuda_tail
@@ -728,8 +746,10 @@ def clip_attempts(
         nvencs = [encoder]
     attempts = []
     if not cpu_filters and nvencs and plan.uniform and caps.cuda_filters():
-        if caps.full_gpu(plan.clips[0].codec) and "hwdownload" in caps.filters:
+        if caps.full_gpu(plan.clips[0].codec):
             attempts += [("gpu_overscan", e) for e in nvencs]
+            if "hwdownload" in caps.filters:
+                attempts += [("gpu_overscan_download", e) for e in nvencs]
         attempts += [("gpu_upload", e) for e in nvencs]
     attempts += [("hybrid", e) for e in nvencs]
     if encoder == "auto":
@@ -808,7 +828,7 @@ def verify_routes(
 
     def reference(mode: str) -> bytes:
         # Same framing as the route under test, so only artifacts differ.
-        ref_mode = "cpu_overscan" if mode == "gpu_overscan" else "cpu"
+        ref_mode = "cpu_overscan" if mode.startswith("gpu_overscan") else "cpu"
         if ref_mode not in references:
             references[ref_mode] = render(ref_mode, "libx264", f"reference_{ref_mode}.mp4")
         return references[ref_mode]

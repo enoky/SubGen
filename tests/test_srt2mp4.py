@@ -61,6 +61,7 @@ def test_attempt_order_on_gpu():
     plan = s.plan_clips([clip(), clip("clip2.mp4")], 20.0)
     assert s.clip_attempts(plan, "auto", GPU_CAPS) == [
         ("gpu_overscan", "hevc_nvenc"), ("gpu_overscan", "h264_nvenc"),
+        ("gpu_overscan_download", "hevc_nvenc"), ("gpu_overscan_download", "h264_nvenc"),
         ("gpu_upload", "hevc_nvenc"), ("gpu_upload", "h264_nvenc"),
         ("hybrid", "hevc_nvenc"), ("hybrid", "h264_nvenc"),
         ("cpu", "libx264"),
@@ -88,13 +89,23 @@ def test_gpu_overscan_command():
     joined = " ".join(cmd)
     assert "-c:v h264_cuvid -crop 0x0x14x14" in joined
     graph = cmd[cmd.index("-filter_complex") + 1]
-    # scaled 1.5% larger, overlaid with the matching offset, then the border is cut off
-    assert "scale_cuda=w=1948:h=1096:interp_algo=lanczos:format=yuv420p" in graph
-    assert "overlay_cuda=x=14:y=8,hwdownload,format=yuv420p,crop=1920:1080:14:8[v]" in graph
+    # scaled 1.5% larger and placed at a negative offset on a 1080p canvas: the border
+    # is cut off on the GPU, and frames never come back to the CPU
+    assert "[b]scale_cuda=w=1948:h=1096:interp_algo=lanczos:format=yuv420p[big]" in graph
+    assert "[a]scale_cuda=w=1920:h=1080:interp_algo=nearest:format=yuv420p[canvas]" in graph
+    assert "[canvas][big]overlay_cuda=x=-14:y=-8[bg]" in graph
+    assert "[bg][subs]overlay_cuda=x=0:y=0[v]" in graph
+    assert "hwdownload" not in graph
     assert cmd[cmd.index("-map") + 3] == "2:a:0"  # narration audio, never the clips'
     assert "-tag:v hvc1" in joined and "-movflags +faststart" in joined
     assert "-g 48" in joined and "-b:a 384k" in joined and "-ar 48000" in joined
     assert joined.count("-i ") == 3  # clips list, cards list, narration: never one input per clip
+
+
+def test_gpu_overscan_download_fallback_crops_on_cpu():
+    graph = build(s.plan_clips([clip()], 20.0), "gpu_overscan_download")
+    graph = graph[graph.index("-filter_complex") + 1]
+    assert "overlay_cuda=x=14:y=8,hwdownload,format=yuv420p,crop=1920:1080:14:8[v]" in graph
 
 
 def test_overscan_margins_keep_aspect():
@@ -146,7 +157,8 @@ def test_verify_routes_keeps_first_clean_gpu_route(tmp_path, monkeypatch):
     plan = s.ClipPlan([clip(w=960, h=512, dur=2.0)], Fraction(24), 48, 64, 36)
     attempts = s.clip_attempts(plan, "auto", GPU_CAPS)
     frames = {"reference_cpu_overscan.mp4": yuv_frame(64, 36), "reference_cpu.mp4": yuv_frame(64, 36),
-              "gpu_overscan.mp4": yuv_frame(64, 36, bottom_uv=0), "gpu_upload.mp4": yuv_frame(64, 36)}
+              "gpu_overscan.mp4": yuv_frame(64, 36, bottom_uv=0),
+              "gpu_overscan_download.mp4": yuv_frame(64, 36, bottom_uv=0), "gpu_upload.mp4": yuv_frame(64, 36)}
     monkeypatch.setattr(s.subprocess, "run", lambda *a, **k: None)
     monkeypatch.setattr(s, "decode_frame", lambda path, i, w, h: frames[Path(path).name])
     kept = s.verify_routes(attempts, plan, tmp_path, Path("n.wav"), GPU_CAPS)
