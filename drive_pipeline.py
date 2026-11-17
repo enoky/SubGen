@@ -10,10 +10,10 @@ Expected layout under ``--root`` (Colab: /content/drive/MyDrive/subgen):
 The narration is first loudness-normalized for YouTube (-14 LUFS, -1.5 dBTP,
 48 kHz); the normalized audio is what gets transcribed and put in the video.
 
-The clips are read straight from Drive while the video encodes, so reading
-overlaps with GPU work instead of waiting for a full copy first. --copy-clips
-copies them to local disk first instead (in parallel; clips already copied
-earlier in the session are skipped). Clip details are cached in
+The clips are first copied to local disk, 16 at a time: a single Drive read
+stream is slower than the GPU encode (it capped full runs at ~2.6x realtime),
+but parallel reads add up. Clips already copied earlier in the session are
+skipped. --stream-clips reads them straight from Drive during the encode instead. Clip details are cached in
 output/.clip_info_cache.json, so reruns over the same clips start right away.
 The narration and outputs go through local disk, then outputs are copied to Drive.
 
@@ -24,7 +24,7 @@ Usage (Colab, after mounting Drive):
     !python -m drive_pipeline --reuse-srt                # re-render output/narration.srt (e.g. after editing it)
     !python -m drive_pipeline --lufs -16                 # different loudness target
     !python -m drive_pipeline --no-normalize             # use narration.wav as is
-    !python -m drive_pipeline --copy-clips               # copy clips locally before encoding
+    !python -m drive_pipeline --stream-clips             # read clips from Drive during the encode
     !python -m drive_pipeline --check-routes             # just check which video route works (~1 min)
     !python -m drive_pipeline --benchmark                # time each video route and the Drive read speed
 """
@@ -53,7 +53,7 @@ def copy_in(src: Path, dst_dir: Path) -> Path:
     return dst
 
 
-def copy_clips(srcs: list[Path], dst_dir: Path, workers: int = 8) -> list[Path]:
+def copy_clips(srcs: list[Path], dst_dir: Path, workers: int = 16) -> list[Path]:
     """Copy clips to ``dst_dir`` in parallel, keeping names and modification times.
     Files already there with the same size and time are skipped; others are removed."""
     dst_dir.mkdir(parents=True, exist_ok=True)
@@ -73,10 +73,14 @@ def copy_clips(srcs: list[Path], dst_dir: Path, workers: int = 8) -> list[Path]:
         return st.st_size
 
     total = sum(s.stat().st_size for s in srcs)
+    start = time.monotonic()
     with ThreadPoolExecutor(max_workers=workers) as pool, \
             tqdm(total=total, desc="Copying clips", unit="B", unit_scale=True, unit_divisor=1024) as bar:
         for size in pool.map(copy, srcs):
             bar.update(size)
+    took = time.monotonic() - start
+    print(f"Clips ready locally: {total / 1e9:.1f} GB in {took:.0f}s ({total / 1e6 / max(took, 1e-6):.0f} MB/s)",
+          flush=True)
     return [dst_dir / s.name for s in srcs]
 
 
@@ -90,9 +94,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--work", type=Path, help="Local working directory. Defaults to /content/subgen-work on Colab.")
     ap.add_argument("--encoder", choices=srt2mp4.ENCODERS, default="auto", help="Video encoder (auto = best available).")
     ap.add_argument(
-        "--copy-clips", action="store_true",
-        help="Copy clips to local disk (in parallel) before encoding instead of reading them from Drive.",
+        "--stream-clips", action="store_true",
+        help="Read clips straight from Drive during the encode instead of copying them first (slower on most days).",
     )
+    ap.add_argument("--copy-clips", action="store_true", help=argparse.SUPPRESS)  # now the default; kept for old commands
     ap.add_argument(
         "--benchmark", action="store_true",
         help="Time each video route and the Drive read speed on ~40 s of your clips (a few minutes), then stop.",
@@ -148,7 +153,7 @@ def main(argv: list[str] | None = None) -> int:
         tmp = tempfile.TemporaryDirectory()
         work = Path(tmp.name)
     if work.exists():
-        for name in ("narration", "script"):  # keep input/clips so --copy-clips can skip them next run
+        for name in ("narration", "script"):  # keep input/clips so the next run can skip copying them
             for old in (work / "input").glob(f"{name}*"):
                 old.unlink()
     local_out = work / "output"
@@ -176,7 +181,7 @@ def main(argv: list[str] | None = None) -> int:
             audio = normalized
             shutil.copyfile(audio, out_dir / audio.name)
             print(f"Saved {out_dir / audio.name}", flush=True)
-        clips = copy_clips(clips_src, work / "input" / "clips") if args.copy_clips and clips_src else clips_src
+        clips = copy_clips(clips_src, work / "input" / "clips") if clips_src and not args.stream_clips else clips_src
         srt_path = local_out / srt_name
         mp4_path = local_out / mp4_name
 

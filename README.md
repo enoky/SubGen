@@ -148,11 +148,12 @@ run the setup cells. Then either:
   video. Any other options are passed to subgen (e.g. `--model large-v3-turbo`).
 - **Web UI:** the last cell prints a public link to the Gradio app.
 
-Clips are read straight from Drive while the video encodes, rather than copied to
-the Colab machine first, so reading overlaps with GPU work. Clip details are cached in
-`output/.clip_info_cache.json`, so reruns over the same clips start right away. If
-streaming from Drive turns out slow, `--copy-clips` copies them to local disk first
-(in parallel; clips already copied earlier in the session are skipped).
+Clips are copied to the Colab machine first, 16 at a time: one Drive read stream is
+slower than the GPU encode, but parallel reads add up. Clips already copied earlier in
+the session are skipped, and clip details are cached in `output/.clip_info_cache.json`,
+so reruns over the same clips start right away. `--stream-clips` reads them straight
+from Drive during the encode instead. `--benchmark` times the Drive read speed and each
+video route on about 40 s of your clips.
 `--check-routes` only checks which video route works on this machine (about a
 minute) and stops, without transcribing or encoding.
 
