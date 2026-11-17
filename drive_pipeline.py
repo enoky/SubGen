@@ -26,6 +26,7 @@ Usage (Colab, after mounting Drive):
     !python -m drive_pipeline --no-normalize             # use narration.wav as is
     !python -m drive_pipeline --copy-clips               # copy clips locally before encoding
     !python -m drive_pipeline --check-routes             # just check which video route works (~1 min)
+    !python -m drive_pipeline --benchmark                # time each video route and the Drive read speed
 """
 
 from __future__ import annotations
@@ -93,6 +94,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Copy clips to local disk (in parallel) before encoding instead of reading them from Drive.",
     )
     ap.add_argument(
+        "--benchmark", action="store_true",
+        help="Time each video route and the Drive read speed on ~40 s of your clips (a few minutes), then stop.",
+    )
+    ap.add_argument(
         "--check-routes", action="store_true",
         help="Only check which video route works on this machine (about a minute), then stop.",
     )
@@ -152,6 +157,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         print(f"Copying narration from {root} to {work}", flush=True)
         audio = copy_in(audio_src, work / "input")
+        if args.benchmark:
+            srt2mp4.benchmark_routes(
+                clips_src, audio, work, probe_cache=out_dir / ".clip_info_cache.json",
+            )
+            return 0
         if args.check_routes:
             srt2mp4.render_clip_video(
                 [], audio, local_out / "route_check.mp4", clips_src, encoder=args.encoder,

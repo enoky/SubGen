@@ -238,3 +238,14 @@ def test_blue_card_unchanged_mode():
     font = s.ImageFont.truetype(str(s.FONT_PATH), s.STYLE.font_size)
     img = s.render_card("Hi", font)
     assert img.mode == "RGB" and img.getpixel((0, 0)) == s.STYLE.bg
+
+
+def test_gpu_plain_is_the_original_route():
+    cmd = build(s.plan_clips([clip()], 20.0), "gpu_plain")
+    graph = cmd[cmd.index("-filter_complex") + 1]
+    assert "-c:v h264_cuvid -crop 0x0x14x14" in " ".join(cmd)
+    assert graph == (
+        "[0:v]scale_cuda=w=1920:h=1080:interp_algo=lanczos:format=yuv420p[bg];"
+        "[1:v]format=yuva420p,hwupload[subs];[bg][subs]overlay_cuda=x=0:y=0[v]"
+    )
+    assert "gpu_plain" not in [m for m, _ in s.clip_attempts(s.plan_clips([clip()], 20.0), "auto", GPU_CAPS)]
