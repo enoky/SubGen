@@ -37,6 +37,11 @@ LEAD = 0.05  # show the text this long before speech starts
 TAIL = 0.30  # keep it this long after speech stops
 MIN_GAP = 0.04  # always leave this much blank between two cues
 OVERLAP_REACH = 0.6  # how far around an overlap to look for the pause between two sentences
+# Narration runs at roughly 10-18 letters per second. A subtitle displayed much faster
+# than this has lost part of its time to a neighbour.
+FAST_RATE = 25.0
+PLAUSIBLE_RATE = 20.0  # ...as long as the two together are spoken at a normal pace
+MIN_RATE_CHARS = 15  # very short subtitles are too noisy to judge
 
 
 @dataclass(frozen=True)
@@ -98,15 +103,47 @@ class Pauses:
         return self.pauses[i] if i >= 0 else None
 
 
+def text_weight(text: str) -> int:
+    """How much speech a subtitle holds, roughly: its letters and digits."""
+    return sum(ch.isalnum() for ch in text)
+
+
+def best_split(
+    prev: list[float], cur: list[float], pauses: Pauses, share: float | None
+) -> tuple[float, float] | None:
+    """The pause most likely to separate two neighbouring sentences spoken over
+    ``prev[0]..cur[1]``. With ``share`` (the first sentence's share of their text),
+    pick the pause nearest the point where that share of the time has passed, with
+    a bonus for longer pauses; without it, the longest pause near the overlap."""
+    span = [(a, b) for a, b in pauses.pauses if prev[0] + 0.2 < a and b < cur[1] - 0.2]
+    if share is None:
+        lo = min(prev[1], cur[0]) - OVERLAP_REACH
+        hi = max(prev[1], cur[0]) + OVERLAP_REACH
+        near = [(a, b) for a, b in span if a <= hi and b >= lo]
+        return max(near, key=lambda ab: ab[1] - ab[0]) if near else None
+    if not span:
+        return None
+    expected = prev[0] + (cur[1] - prev[0]) * share
+    return min(span, key=lambda ab: abs((ab[0] + ab[1]) / 2 - expected) - min(ab[1] - ab[0], 1.0))
+
+
 def retime(
     times: list[tuple[float, float]],
     pauses: list[tuple[float, float]],
+    texts: list[str] | None = None,
     lead: float = LEAD,
     tail: float = TAIL,
     min_gap: float = MIN_GAP,
 ) -> list[tuple[float, float]]:
-    """New (start, end) for each cue (see module docs). Cues must be in time order."""
+    """New (start, end) for each cue (see module docs). Cues must be in time order.
+    ``texts`` (each cue's text) lets neighbours that share time badly be re-split."""
     p = Pauses(pauses)
+    weights = [text_weight(t) for t in texts] if texts else None
+
+    def share(i: int) -> float | None:
+        if not weights or weights[i - 1] + weights[i] == 0:
+            return None
+        return weights[i - 1] / (weights[i - 1] + weights[i])
 
     # 1. Snap each edge that sits inside a pause to the speech next to it.
     speech = []
@@ -121,22 +158,39 @@ def retime(
         speech.append([s, e])
 
     # 2. Untangle neighbours whose speech still overlaps (a word stolen from the
-    #    other sentence): split them at the pause between them, if there is one.
-    #    The gap between sentences is normally the longest pause near the overlap
-    #    (commas inside a sentence give shorter ones).
+    #    other sentence): split them at the pause between the two sentences.
     for i in range(1, len(speech)):
         prev, cur = speech[i - 1], speech[i]
         if prev[1] > cur[0]:
-            lo, hi = min(prev[1], cur[0]) - OVERLAP_REACH, max(prev[1], cur[0]) + OVERLAP_REACH
-            near = [(a, b) for a, b in p.pauses
-                    if prev[0] < a and b < cur[1] and a <= hi and b >= lo]
-            if near:
-                prev[1], cur[0] = max(near, key=lambda ab: ab[1] - ab[0])
+            gap = best_split(prev, cur, p, share(i))
+            if gap:
+                prev[1], cur[0] = gap
             else:
                 mid = (prev[1] + cur[0]) / 2
                 prev[1], cur[0] = mid, mid
 
-    # 3. Padding, kept clear of neighbouring cues and the next stretch of speech.
+    # 3. A subtitle shown impossibly fast for its text next to one with time to
+    #    spare means their boundary is at the wrong pause (e.g. a pause inside one
+    #    of the sentences): move it to the pause that fits the text lengths.
+    if weights:
+        def rate(i: int) -> float:
+            return weights[i] / max(speech[i][1] - speech[i][0], 0.05)
+
+        for i in range(1, len(speech)):
+            prev, cur = speech[i - 1], speech[i]
+            fast = [j for j in (i - 1, i) if weights[j] >= MIN_RATE_CHARS and rate(j) > FAST_RATE]
+            together = (weights[i - 1] + weights[i]) / max(cur[1] - prev[0], 0.05)
+            if not fast or together > PLAUSIBLE_RATE:
+                continue
+            gap = best_split(prev, cur, p, share(i))
+            if gap:
+                before = max(rate(i - 1), rate(i))
+                old = (prev[1], cur[0])
+                prev[1], cur[0] = gap
+                if max(rate(i - 1), rate(i)) >= before:
+                    prev[1], cur[0] = old  # no better; leave it
+
+    # 4. Padding, kept clear of neighbouring cues and the next stretch of speech.
     out = []
     for i, (s, e) in enumerate(speech):
         prev_end = out[-1][1] if out else 0.0
@@ -154,9 +208,10 @@ def retime(
 
 
 def retime_with_report(
-    times: list[tuple[float, float]], pauses: list[tuple[float, float]], **kw
+    times: list[tuple[float, float]], pauses: list[tuple[float, float]],
+    texts: list[str] | None = None, **kw,
 ) -> tuple[list[tuple[float, float]], list[Change]]:
-    new = retime(times, pauses, **kw)
+    new = retime(times, pauses, texts, **kw)
     changes = [Change(i, old, nw) for i, (old, nw) in enumerate(zip(times, new))
                if abs(old[0] - nw[0]) > 0.15 or abs(old[1] - nw[1]) > 0.15]
     return new, changes
@@ -181,11 +236,12 @@ def retime_srt(audio: Path, srt_in: Path, srt_out: Path | None = None, **kw) -> 
     subs = list(srt.parse(Path(srt_in).read_text(encoding="utf-8-sig")))
     times = [(s.start.total_seconds(), s.end.total_seconds()) for s in subs]
     pauses = detect_pauses(audio, duration=times[-1][1] if times else None)
-    new, changes = retime_with_report(times, pauses, **kw)
+    texts = [s.content.replace("\n", " ") for s in subs]
+    new, changes = retime_with_report(times, pauses, texts, **kw)
     for sub, (a, b) in zip(subs, new):
         sub.start = srt.timedelta(seconds=a)
         sub.end = srt.timedelta(seconds=b)
-    print(summarize(changes, len(subs), [s.content.replace("\n", " ") for s in subs]), flush=True)
+    print(summarize(changes, len(subs), texts), flush=True)
     Path(srt_out or srt_in).write_text(srt.compose(subs), encoding="utf-8")
     return changes
 

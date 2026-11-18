@@ -1095,7 +1095,9 @@ def retime_cues(
     import retime
 
     times = [(cue.start, cue.end) for cue in cues]
-    new, changes = retime.retime_with_report(times, pauses, lead=args.retime_lead, tail=args.retime_tail)
+    new, changes = retime.retime_with_report(
+        times, pauses, [cue.text for cue in cues], lead=args.retime_lead, tail=args.retime_tail
+    )
     print(retime.summarize(changes, len(cues), [cue.text for cue in cues]), flush=True)
     return [replace(cue, start=s, end=e) for cue, (s, e) in zip(cues, new)]
 

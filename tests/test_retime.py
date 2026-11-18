@@ -68,3 +68,28 @@ def test_retime_srt_on_real_audio(tmp_path):
     got = [(s.start.total_seconds(), s.end.total_seconds()) for s in srt.parse(subs.read_text())]
     assert got[0][0] == pytest.approx(0.95, abs=0.03) and got[0][1] == pytest.approx(3.3, abs=0.03)
     assert got[1][0] == pytest.approx(3.95, abs=0.03) and got[1][1] == pytest.approx(6.3, abs=0.03)
+
+
+# Subtitle 258/259 from a real video: 258 opens with "In its words," and a 1 s
+# dramatic pause before a long quote; 259 starts with "Reason", a word inside that
+# quote. 258 ended up cut at the dramatic pause and 259 took the rest of its time.
+QUOTE = 'In its words, "But, the report of Reason must be hospitably received, and treated with respect."'
+NEXT = "Reason can't lift the veil of the unknowable, the Initiates said, but it can tell us certain things."
+CASE_PAUSES = [(0.0, 0.5), (1.35, 2.35), (2.65, 2.86), (5.77, 5.96), (7.47, 7.97),
+               (10.61, 10.82), (11.98, 12.2), (16.24, 17.5)]
+CASE_WANT = [(0.45, 7.77), (7.92, 16.54)]
+
+
+def test_subtitle_cut_at_a_pause_inside_its_sentence_is_repaired():
+    broken = [(0.45, 1.65), (2.30, 16.54)]  # 258 shown for 1.2 s at ~70 letters/s
+    assert r.retime(broken, CASE_PAUSES, [QUOTE, NEXT]) == approx(CASE_WANT)
+
+
+def test_overlap_is_split_where_the_text_lengths_say_not_at_the_longest_pause():
+    stolen = [(0.5, 7.47), (3.9, 16.24)]  # 259 timed from "Reason" inside the quote
+    assert r.retime(stolen, CASE_PAUSES, [QUOTE, NEXT]) == approx(CASE_WANT)
+
+
+def test_normal_pace_is_left_alone():
+    assert r.retime(CASE_WANT, CASE_PAUSES, [QUOTE, NEXT]) == approx(CASE_WANT)
+    assert r.retime(CASE_WANT, CASE_PAUSES, [QUOTE, NEXT]) == r.retime(CASE_WANT, CASE_PAUSES)
