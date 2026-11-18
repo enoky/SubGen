@@ -30,6 +30,7 @@ Usage (Colab, after mounting Drive):
     !python -m drive_pipeline --music-level -24          # quieter background music
     !python -m drive_pipeline --no-music                 # no background music
     !python -m drive_pipeline --tint-opacity 0.3         # lighter indigo tint over the clips (0 = off)
+    !python -m drive_pipeline --no-retime                # keep subtitle times as WhisperX gave them
     !python -m drive_pipeline --stream-clips             # read clips from Drive during the encode
     !python -m drive_pipeline --check-routes             # just check which video route works (~1 min)
     !python -m drive_pipeline --benchmark                # time each video route and the Drive read speed
@@ -50,6 +51,7 @@ from tqdm import tqdm
 
 import background_music
 import normalize_audio
+import retime
 import srt2mp4
 
 DEFAULT_ROOT = Path("/content/drive/MyDrive/subgen")
@@ -224,6 +226,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Strength of the tint, 0-1 (default {srt2mp4.VIDEO_STYLE.tint_opacity:g}; 0 turns it off).",
     )
     ap.add_argument(
+        "--no-retime", action="store_true",
+        help="Keep subtitle times as they are. By default they are snapped to the speech, "
+             "including a reused SRT (the original is kept once as narration.srt.bak).",
+    )
+    ap.add_argument("--retime-lead", type=float, default=retime.LEAD,
+                    help=f"Seconds a subtitle appears before its speech (default {retime.LEAD:g}).")
+    ap.add_argument("--retime-tail", type=float, default=retime.TAIL,
+                    help=f"Seconds a subtitle stays after its speech (default {retime.TAIL:g}).")
+    ap.add_argument(
         "--lufs", type=float, default=normalize_audio.TARGET_I,
         help=f"Narration loudness target in LUFS (default {normalize_audio.TARGET_I:g}, YouTube's reference).",
     )
@@ -299,10 +310,21 @@ def main(argv: list[str] | None = None) -> int:
                 raise SystemExit(f"--reuse-srt: {existing} does not exist yet.")
             shutil.copyfile(existing, srt_path)
             print(f"Reusing {existing}", flush=True)
+            if not args.no_retime:
+                backup = existing.with_name(existing.name + ".bak")
+                if not backup.exists():
+                    shutil.copyfile(existing, backup)
+                print("Snapping subtitle times to the speech", flush=True)
+                retime.retime_srt(audio, srt_path, lead=args.retime_lead, tail=args.retime_tail)
+                shutil.copyfile(srt_path, existing)
+                print(f"Saved {existing} (original kept as {backup.name})", flush=True)
         else:
             import subgen  # imported here so --reuse-srt doesn't load torch/WhisperX
 
-            cmd = [str(audio), "-o", str(srt_path), *subgen_args]
+            cmd = [str(audio), "-o", str(srt_path), *subgen_args,
+                   "--retime-lead", str(args.retime_lead), "--retime-tail", str(args.retime_tail)]
+            if args.no_retime:
+                cmd.append("--no-retime")
             if script_src.is_file():
                 print(f"Using script {script_src}", flush=True)
                 cmd += ["--script", str(copy_in(script_src, work / "input"))]
