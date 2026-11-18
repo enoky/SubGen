@@ -110,6 +110,10 @@ uv run python -m srt2mp4 subtitles.srt narration.wav out.mp4 --clips path\to\cli
   ffmpeg input. Any clip whose format differs from the rest (size, frame rate, codec)
   is re-encoded to match first, so the join stays seamless and on the GPU.
 - The text gets a black outline as well as the shadow, so it stays readable on footage.
+- A deep-indigo wash (`#1E1248` at 45% opacity) darkens the footage behind the text.
+  It is part of the subtitle overlay, so it costs no extra encoding time. Change it
+  with `--tint "#RRGGBB"` and `--tint-opacity 0.3`, or turn it off with
+  `--tint-opacity 0`.
 - The encoding is tuned for YouTube 1080p uploads: HEVC (NVENC) quality-targeted VBR
   averaging around 10 Mbps, a keyframe every 2 seconds, BT.709 tags, AAC-LC 48 kHz
   stereo at 384 kbps, and `+faststart`.

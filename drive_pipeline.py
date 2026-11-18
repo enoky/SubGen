@@ -29,6 +29,7 @@ Usage (Colab, after mounting Drive):
     !python -m drive_pipeline --no-normalize             # use narration.wav as is
     !python -m drive_pipeline --music-level -24          # quieter background music
     !python -m drive_pipeline --no-music                 # no background music
+    !python -m drive_pipeline --tint-opacity 0.3         # lighter indigo tint over the clips (0 = off)
     !python -m drive_pipeline --stream-clips             # read clips from Drive during the encode
     !python -m drive_pipeline --check-routes             # just check which video route works (~1 min)
     !python -m drive_pipeline --benchmark                # time each video route and the Drive read speed
@@ -38,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import replace
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 import tempfile
@@ -214,6 +216,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Music fade-out at the end of the video, in seconds (default {background_music.DEFAULT_FADE:g}).",
     )
     ap.add_argument(
+        "--tint", type=srt2mp4.parse_color, default=srt2mp4.VIDEO_STYLE.tint,
+        help="Colour washed over the clips behind the text to darken them (default #1E1248, deep indigo).",
+    )
+    ap.add_argument(
+        "--tint-opacity", type=float, default=srt2mp4.VIDEO_STYLE.tint_opacity,
+        help=f"Strength of the tint, 0-1 (default {srt2mp4.VIDEO_STYLE.tint_opacity:g}; 0 turns it off).",
+    )
+    ap.add_argument(
         "--lufs", type=float, default=normalize_audio.TARGET_I,
         help=f"Narration loudness target in LUFS (default {normalize_audio.TARGET_I:g}, YouTube's reference).",
     )
@@ -317,6 +327,7 @@ def main(argv: list[str] | None = None) -> int:
             srt2mp4.render_video(
                 srt2mp4.parse_srt(srt_path), video_audio, mp4_path, encoder=args.encoder, background_clips=clips,
                 probe_cache=out_dir / ".clip_info_cache.json", cpu_filters=args.cpu_filters,
+                style=replace(srt2mp4.VIDEO_STYLE, tint=args.tint, tint_opacity=args.tint_opacity),
             )
             print(f"Copying video to {out_dir / mp4_name}", flush=True)
             shutil.copyfile(mp4_path, out_dir / mp4_name)
