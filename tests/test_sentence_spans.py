@@ -34,3 +34,18 @@ def test_opening_quote_is_not_moved(nlp):
     text = 'He paused. "Wisdom is earned," he said.'
     out = sentences(nlp, text)
     assert out[-1].startswith('"Wisdom')
+
+
+def timed(start, end, fallback=(0.0, 60.0)):
+    return subgen.TimedWord("w", start, end, fallback[0], fallback[1], 0, 1)
+
+
+def test_script_sentence_times_ignore_stray_words():
+    # an unaligned word (e.g. a number) must not pull in its 0-60 s Whisper segment
+    assert subgen.script_sentence_times(
+        [(timed(10.0, 10.4), 0.0), (timed(None, None), 1.0), (timed(11.0, 12.5), 2.0)]
+    ) == (10.0, 12.5)
+    # a transcript-only word (.5 position) at the next sentence's boundary is ignored
+    assert subgen.script_sentence_times([(timed(10.0, 10.4), 0.0), (timed(13.8, 14.1), 0.5)]) == (10.0, 10.4)
+    # segment bounds only as a last resort
+    assert subgen.script_sentence_times([(timed(None, None, (20.0, 25.0)), 0.0)]) == (20.0, 25.0)

@@ -301,6 +301,27 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--no-retime",
+        dest="retime",
+        action="store_false",
+        help=(
+            "Keep WhisperX's raw subtitle times. By default each subtitle's start and end "
+            "are snapped to where speech actually starts and stops in the audio."
+        ),
+    )
+    parser.add_argument(
+        "--retime-lead",
+        type=float,
+        default=0.05,
+        help="Seconds a subtitle appears before its speech starts (default 0.05).",
+    )
+    parser.add_argument(
+        "--retime-tail",
+        type=float,
+        default=0.30,
+        help="Seconds a subtitle stays after its speech stops (default 0.30).",
+    )
+    parser.add_argument(
         "--background-clips",
         type=Path,
         help=(
@@ -818,18 +839,12 @@ def build_script_cues(
     cues: list[SentenceCue] = []
     last_end = 0.0
     for text, lo, hi in sentences:
-        start: float | None = None
-        end: float | None = None
-        for key_index, position in enumerate(mapped):
-            if position is None or not (lo <= position < hi):
-                continue
-            word = timed_words[key_to_word[key_index]]
-            word_start = word.start if word.start is not None else word.fallback_start
-            word_end = word.end if word.end is not None else word.fallback_end
-            if word_start is not None:
-                start = word_start if start is None else min(start, word_start)
-            if word_end is not None:
-                end = word_end if end is None else max(end, word_end)
+        members = [
+            (timed_words[key_to_word[key_index]], position)
+            for key_index, position in enumerate(mapped)
+            if position is not None and lo <= position < hi
+        ]
+        start, end = script_sentence_times(members)
 
         if start is None or end is None:
             # No transcript words aligned to this sentence (e.g. a line the speaker
@@ -843,6 +858,33 @@ def build_script_cues(
         last_end = end
 
     return cues, ratio
+
+
+def script_sentence_times(
+    members: list[tuple[TimedWord, float]]
+) -> tuple[float | None, float | None]:
+    """Start and end of a script sentence from the transcript words mapped to it.
+
+    One stray word must not stretch the whole subtitle, so timings are taken in
+    order of trust, using the first tier that has any:
+    1. words that matched (or replaced) a script word and have their own aligned time;
+    2. also transcript-only words (Whisper heard something not in the script; these
+       sit at a .5 position just before the next script word, often at the boundary
+       with the next sentence);
+    3. a word's Whisper segment bounds, which can be tens of seconds wide, only when
+       no word in the sentence has an aligned time at all.
+    """
+    tiers = [
+        [(w.start, w.end) for w, pos in members if pos == int(pos)],
+        [(w.start, w.end) for w, _ in members],
+        [(w.fallback_start, w.fallback_end) for w, _ in members],
+    ]
+    for tier in tiers:
+        starts = [s for s, _ in tier if s is not None]
+        ends = [e for _, e in tier if e is not None]
+        if starts and ends:
+            return min(starts), max(ends)
+    return None, None
 
 
 def script_sentence_token_ranges(
@@ -1046,6 +1088,18 @@ def last_time(
     return None
 
 
+def retime_cues(
+    cues: list[SentenceCue], pauses: list[tuple[float, float]], args: argparse.Namespace
+) -> list[SentenceCue]:
+    """Snap each cue's start and end to the speech (see retime.py) and report the changes."""
+    import retime
+
+    times = [(cue.start, cue.end) for cue in cues]
+    new, changes = retime.retime_with_report(times, pauses, lead=args.retime_lead, tail=args.retime_tail)
+    print(retime.summarize(changes, len(cues), [cue.text for cue in cues]), flush=True)
+    return [replace(cue, start=s, end=e) for cue, (s, e) in zip(cues, new)]
+
+
 def write_srt(cues: list[SentenceCue], output_path: Path) -> None:
     subtitles = [
         srt.Subtitle(
@@ -1080,6 +1134,12 @@ def main(argv: list[str] | None = None) -> int:
         cues = sentence_cues(aligned, args)
     if not cues:
         raise RuntimeError("WhisperX did not produce any sentence-level subtitle cues.")
+
+    if args.retime:
+        import retime
+
+        stage(args, "Snapping subtitle times to the speech")
+        cues = retime_cues(cues, retime.detect_pauses(audio_path, duration=cues[-1].end), args)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     write_srt(cues, output_path)

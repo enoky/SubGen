@@ -71,6 +71,24 @@ uv run python -m subgen path\to\audio.wav --model-dir .\models --local-files-onl
 By default, the output file is written next to the input file using the same stem
 and an `.srt` extension.
 
+### Subtitle timing
+
+WhisperX's word alignment often stretches a sentence's first word back into the pause
+before it, or its last word into the pause after it, so subtitles appear early or
+linger. After transcribing, SubGen finds the pauses in the narration (ffmpeg
+`silencedetect`) and snaps each subtitle to where its speech starts and stops, then
+shows it 0.05 s before the speech and holds it 0.3 s after (`--retime-lead`,
+`--retime-tail`), never overlapping its neighbours. `--no-retime` keeps the raw times.
+With `--script`, words that don't match the script and Whisper's segment-wide
+fallback times no longer stretch a sentence's timing. To fix an existing SRT:
+
+```powershell
+uv run python -m retime narration.wav narration.srt   # rewrites it, keeps narration.srt.bak
+```
+
+The Drive pipeline also retimes a reused SRT (`--reuse-srt`), keeping the original once
+as `narration.srt.bak`.
+
 ### MP4 export
 
 Add `--mp4` to also render a 1920x1080, 24 fps bluescreen video of the subtitles
