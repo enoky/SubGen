@@ -68,12 +68,25 @@ class Style:
     shadow_blur: float = 2.0
     shadow_opacity: float = 0.85
     stroke_width: int = 0  # black outline around the glyphs, in px
+    # Colour wash over the background video (behind the text) to darken it and make the
+    # text easier to read: an RGB colour and its opacity (0 = off, 1 = solid colour).
+    tint: tuple[int, int, int] = (0x1E, 0x12, 0x48)  # deep indigo
+    tint_opacity: float = 0.0
     pix_fmt: str = "yuv420p"
 
 
 STYLE = Style()
 # Over busy footage a soft shadow alone is not enough contrast, so add a black outline.
-VIDEO_STYLE = replace(STYLE, stroke_width=4, shadow_offset=5, shadow_blur=3.0, shadow_opacity=0.9)
+VIDEO_STYLE = replace(STYLE, stroke_width=4, shadow_offset=5, shadow_blur=3.0, shadow_opacity=0.9,
+                      tint_opacity=0.45)
+
+
+def parse_color(value: str) -> tuple[int, int, int]:
+    """'#1E1248' or '1E1248' -> (30, 18, 72)."""
+    v = value.strip().lstrip("#")
+    if not re.fullmatch(r"[0-9a-fA-F]{6}", v):
+        raise ValueError(f"Expected a colour like #1E1248, got {value!r}")
+    return int(v[0:2], 16), int(v[2:4], 16), int(v[4:6], 16)
 
 
 class TimedText(Protocol):
@@ -144,7 +157,10 @@ def render_card(
         img.putalpha(mask)
         return img
 
-    base = Image.new("RGBA", (w, h), (0, 0, 0, 0) if transparent else (*style.bg, 255))
+    if transparent:  # overlaid on video: optional colour wash, applied to every frame
+        base = Image.new("RGBA", (w, h), (*style.tint, round(255 * max(0.0, min(1.0, style.tint_opacity)))))
+    else:
+        base = Image.new("RGBA", (w, h), (*style.bg, 255))
     img = Image.alpha_composite(base, layer((0, 0, 0), shadow_mask))
     if style.stroke_width:
         img = Image.alpha_composite(img, layer((0, 0, 0), body_mask))
@@ -1121,6 +1137,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("audio", type=Path, nargs="?", help="Narration audio, or a video whose audio track is used.")
     ap.add_argument("output", type=Path, nargs="?", help="Defaults to the .srt path with an .mp4 extension.")
     ap.add_argument("--clips", type=Path, help="Directory of .mp4 clips to use as the background.")
+    ap.add_argument("--tint", type=parse_color, default=VIDEO_STYLE.tint,
+                    help="Colour washed over the clips behind the text (default #1E1248, deep indigo).")
+    ap.add_argument("--tint-opacity", type=float, default=VIDEO_STYLE.tint_opacity,
+                    help=f"Strength of the tint, 0-1 (default {VIDEO_STYLE.tint_opacity:g}; 0 turns it off).")
     ap.add_argument(
         "--cpu-filters", action="store_true",
         help="Skip the GPU filter routes: crop, scale and overlay on the CPU (GPU still decodes/encodes).",
@@ -1143,6 +1163,7 @@ def main(argv: list[str] | None = None) -> int:
     output = render_video(
         cues, args.audio, args.output or args.srt.with_suffix(".mp4"), args.encoder, args.keep_frames,
         background_clips=args.clips, cpu_filters=args.cpu_filters,
+        style=replace(VIDEO_STYLE, tint=args.tint, tint_opacity=args.tint_opacity) if args.clips else None,
     )
     print(f"Wrote {output}")
     return 0

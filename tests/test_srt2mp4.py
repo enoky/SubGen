@@ -225,7 +225,7 @@ def test_probe_cache_roundtrip(tmp_path, monkeypatch):
 
 def test_transparent_card_has_outline():
     font = s.ImageFont.truetype(str(s.FONT_PATH), s.VIDEO_STYLE.font_size)
-    img = s.render_card("Hello there", font, s.VIDEO_STYLE, transparent=True)
+    img = s.render_card("Hello there", font, s.replace(s.VIDEO_STYLE, tint_opacity=0), transparent=True)
     assert img.mode == "RGBA"
     alpha = img.getchannel("A")
     assert alpha.getpixel((0, 0)) == 0  # background is clear
@@ -249,3 +249,21 @@ def test_gpu_plain_is_the_original_route():
         "[1:v]format=yuva420p,hwupload[subs];[bg][subs]overlay_cuda=x=0:y=0[v]"
     )
     assert "gpu_plain" not in [m for m, _ in s.clip_attempts(s.plan_clips([clip()], 20.0), "auto", GPU_CAPS)]
+
+
+def test_parse_color():
+    assert s.parse_color("#1E1248") == (30, 18, 72)
+    assert s.parse_color("ff8800") == (255, 136, 0)
+    with pytest.raises(ValueError):
+        s.parse_color("indigo")
+
+
+def test_tint_washes_the_clip_card_only():
+    font = s.ImageFont.truetype(str(s.FONT_PATH), s.VIDEO_STYLE.font_size)
+    tinted = s.render_card("", font, s.VIDEO_STYLE, transparent=True)
+    assert tinted.getpixel((0, 0)) == (0x1E, 0x12, 0x48, round(255 * s.VIDEO_STYLE.tint_opacity))
+    off = s.render_card("", font, s.replace(s.VIDEO_STYLE, tint_opacity=0), transparent=True)
+    assert off.getpixel((0, 0))[3] == 0
+    text = s.render_card("Readable", font, s.VIDEO_STYLE, transparent=True)
+    assert any(px == (255, 255, 255, 255) for _, px in text.getcolors(maxcolors=1 << 24))  # text stays solid white
+    assert s.render_card("Hi", font).getpixel((0, 0)) == s.STYLE.bg  # bluescreen mode unchanged
