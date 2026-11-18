@@ -5,6 +5,7 @@ Expected layout under ``--root`` (Colab: /content/drive/MyDrive/subgen):
     narration.wav       narration audio (required)
     clips/*.mp4         background clips, joined in natural filename order (required)
     script.txt          original script, used for cue wording if present (optional)
+    528Hz_ambient.m4a   background music under the narration, if present (optional)
     output/             narration.srt, narration.mp4 and narration_norm.wav are written here
 
 The narration is first loudness-normalized for YouTube (-14 LUFS, -1.5 dBTP,
@@ -26,6 +27,8 @@ Usage (Colab, after mounting Drive):
     !python -m drive_pipeline --reuse-srt                # re-render output/narration.srt (e.g. after editing it)
     !python -m drive_pipeline --lufs -16                 # different loudness target
     !python -m drive_pipeline --no-normalize             # use narration.wav as is
+    !python -m drive_pipeline --music-level -24          # quieter background music
+    !python -m drive_pipeline --no-music                 # no background music
     !python -m drive_pipeline --stream-clips             # read clips from Drive during the encode
     !python -m drive_pipeline --check-routes             # just check which video route works (~1 min)
     !python -m drive_pipeline --benchmark                # time each video route and the Drive read speed
@@ -43,6 +46,7 @@ from pathlib import Path
 
 from tqdm import tqdm
 
+import background_music
 import normalize_audio
 import srt2mp4
 
@@ -106,6 +110,37 @@ def normalized_narration(
     return local
 
 
+MIX_META = ".narration_mix.json"
+
+
+def mixed_narration(
+    narration: Path, music_src: Path, work_in: Path, level: float, fade: float,
+    narration_lufs: float | None, true_peak: float,
+) -> Path:
+    """``narration`` with the background music mixed under it, reused within the
+    session while the narration, the music and the settings are unchanged. (The mix
+    is large, so it is kept on local disk only; making it takes about a minute.)"""
+    def stamp(p: Path) -> dict:
+        st = p.stat()
+        return {"name": p.name, "size": st.st_size, "mtime_ns": st.st_mtime_ns}
+
+    key = {"narration": stamp(narration), "music": stamp(music_src), "level": level, "fade": fade,
+           "narration_lufs": narration_lufs, "true_peak": true_peak}
+    out, meta = work_in / f"{narration.stem.removesuffix(normalize_audio.SUFFIX)}_mix.wav", work_in / MIX_META
+    try:
+        if out.is_file() and json.loads(meta.read_text(encoding="utf-8")) == key:
+            print(f"Reusing background-music mix {out} (nothing changed)", flush=True)
+            return out
+    except (OSError, ValueError):
+        pass
+    meta.unlink(missing_ok=True)
+    print(f"Mixing {music_src.name} under the narration", flush=True)
+    music = copy_in(music_src, work_in)
+    background_music.mix(narration, music, out, level, fade, narration_lufs, true_peak)
+    meta.write_text(json.dumps(key), encoding="utf-8")
+    return out
+
+
 def copy_clips(srcs: list[Path], dst_dir: Path, workers: int = 16) -> list[Path]:
     """Copy clips to ``dst_dir`` in parallel, keeping names and modification times.
     Files already there with the same size and time are skipped; others are removed."""
@@ -164,6 +199,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip the GPU filter routes (crop/scale/overlay on the CPU; slower, GPU still decodes/encodes).",
     )
     ap.add_argument("--no-normalize", action="store_true", help="Skip loudness normalization of the narration.")
+    ap.add_argument(
+        "--music", default="528Hz_ambient.m4a",
+        help="Background music file name inside --root, used if it exists (default 528Hz_ambient.m4a).",
+    )
+    ap.add_argument("--no-music", action="store_true", help="Don't add background music.")
+    ap.add_argument(
+        "--music-level", type=float, default=background_music.DEFAULT_LEVEL,
+        help=f"Music loudness relative to the narration in LU (default {background_music.DEFAULT_LEVEL:g}; "
+             "about -18 to -25 suits music under voice-over).",
+    )
+    ap.add_argument(
+        "--music-fade", type=float, default=background_music.DEFAULT_FADE,
+        help=f"Music fade-out at the end of the video, in seconds (default {background_music.DEFAULT_FADE:g}).",
+    )
     ap.add_argument(
         "--lufs", type=float, default=normalize_audio.TARGET_I,
         help=f"Narration loudness target in LUFS (default {normalize_audio.TARGET_I:g}, YouTube's reference).",
@@ -253,8 +302,20 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Saved {out_dir / srt_name}", flush=True)
 
         if not args.srt_only:
+            # The music goes only into the video; transcription above used the clean narration.
+            video_audio = audio
+            music_src = root / args.music
+            if args.no_music:
+                pass
+            elif music_src.is_file():
+                video_audio = mixed_narration(
+                    audio, music_src, work / "input", args.music_level, args.music_fade,
+                    None if args.no_normalize else args.lufs, args.true_peak,
+                )
+            else:
+                print(f"No background music ({music_src} not found)", flush=True)
             srt2mp4.render_video(
-                srt2mp4.parse_srt(srt_path), audio, mp4_path, encoder=args.encoder, background_clips=clips,
+                srt2mp4.parse_srt(srt_path), video_audio, mp4_path, encoder=args.encoder, background_clips=clips,
                 probe_cache=out_dir / ".clip_info_cache.json", cpu_filters=args.cpu_filters,
             )
             print(f"Copying video to {out_dir / mp4_name}", flush=True)
