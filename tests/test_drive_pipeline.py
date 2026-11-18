@@ -59,3 +59,27 @@ def test_incomplete_drive_copy_is_not_trusted(tmp_path, monkeypatch):
     (out / dp.NORM_META).unlink()  # e.g. the previous run stopped before finishing the copy
     dp.normalized_narration(src, out, tmp_path / "fresh", -14, -1.5)
     assert len(calls) == 2
+
+
+def test_music_mix_reused_until_something_changes(tmp_path, monkeypatch):
+    narration = tmp_path / "work" / "narration_norm.wav"
+    narration.parent.mkdir()
+    narration.write_bytes(b"narration")
+    music = tmp_path / "drive" / "528Hz_ambient.m4a"
+    music.parent.mkdir()
+    music.write_bytes(b"music")
+    calls = []
+
+    def fake_mix(n, m, out, level, fade, n_lufs, tp):
+        calls.append(level)
+        out.write_bytes(b"mix")
+        return out
+
+    monkeypatch.setattr(dp.background_music, "mix", fake_mix)
+    work_in = tmp_path / "work"
+    out = dp.mixed_narration(narration, music, work_in, -20, 8, -14, -1.5)
+    assert out.name == "narration_mix.wav" and len(calls) == 1
+    dp.mixed_narration(narration, music, work_in, -20, 8, -14, -1.5)
+    assert len(calls) == 1  # reused
+    dp.mixed_narration(narration, music, work_in, -24, 8, -14, -1.5)
+    assert calls[-1] == -24 and len(calls) == 2  # level changed

@@ -167,6 +167,21 @@ or skip this step with `--no-normalize`.
 
 The same pipeline runs anywhere with `uv run python -m drive_pipeline --root DIR`.
 
+### Background music
+
+If `MyDrive/subgen/528Hz_ambient.m4a` exists (`--music NAME` picks another file),
+it plays under the narration in the video. It is cut to the narration's length from
+its start (keeping its own fade-in), faded out over the last 8 seconds
+(`--music-fade`), and set 20 LU below the narration by measuring both loudnesses
+(`--music-level`, e.g. `-24` for quieter; about -18 to -25 suits music under
+voice-over). A limiter keeps the mix under the true-peak ceiling, and music shorter
+than the narration is looped. Transcription still uses the clean narration.
+`--no-music` turns it off. On its own:
+
+```powershell
+uv run python -m background_music narration_norm.wav music.m4a mix.wav --level -20 --fade 8
+```
+
 ### Loudness normalization on its own
 
 ```powershell
