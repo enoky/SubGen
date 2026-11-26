@@ -189,6 +189,19 @@ or skip this step with `--no-normalize`.
 
 The same pipeline runs anywhere with `uv run python -m drive_pipeline --root DIR`.
 
+### YouTube Shorts
+
+Portrait clips make a 1080x1920 Short automatically (`--format shorts` forces it,
+`--format landscape` forces 1920x1080). LTX clips at 1088x1920 are trimmed 4 px on
+each side with no scaling; 704x1280 clips are trimmed 14 px top and bottom and
+scaled up. The text is larger (68 px) in a narrower column centred a little above
+the middle, clear of the Shorts title area and side buttons, and keeps the outline
+and indigo tint. A warning is printed if the narration is longer than 3 minutes,
+the longest YouTube treats as a Short. On Colab, keep each Short in its own folder,
+e.g. `MyDrive/subgen_shorts/` with `narration.wav` and `clips/`, and run
+`drive_pipeline --root /content/drive/MyDrive/subgen_shorts`; the background music
+from `MyDrive/subgen/` is used if that folder has none.
+
 ### Background music
 
 If `MyDrive/subgen/528Hz_ambient.m4a` exists (`--music NAME` picks another file),

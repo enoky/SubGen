@@ -72,6 +72,7 @@ class Style:
     # text easier to read: an RGB colour and its opacity (0 = off, 1 = solid colour).
     tint: tuple[int, int, int] = (0x1E, 0x12, 0x48)  # deep indigo
     tint_opacity: float = 0.0
+    text_center: float = 0.5  # vertical centre of the text block, as a fraction of the height
     pix_fmt: str = "yuv420p"
 
 
@@ -79,6 +80,43 @@ STYLE = Style()
 # Over busy footage a soft shadow alone is not enough contrast, so add a black outline.
 VIDEO_STYLE = replace(STYLE, stroke_width=4, shadow_offset=5, shadow_blur=3.0, shadow_opacity=0.9,
                       tint_opacity=0.45)
+
+
+# YouTube Shorts: 1080x1920 portrait. Bigger text in a narrower column, centred a
+# little above the middle, keeps it clear of the Shorts interface (title and channel
+# along the bottom, buttons down the right).
+SHORTS_LAYOUT = dict(width=1080, height=1920, font_size=68, line_height=98, max_width=780, text_center=0.40)
+SHORTS_MAX_SECONDS = 180  # longest video YouTube accepts as a Short
+FORMATS = ("auto", "landscape", "shorts")
+
+
+def is_portrait(style: Style) -> bool:
+    return style.height > style.width
+
+
+def shorts_style(style: Style) -> Style:
+    """``style`` laid out for a 1080x1920 Short (colours, outline and tint kept)."""
+    return style if is_portrait(style) else replace(style, **SHORTS_LAYOUT)
+
+
+def landscape_style(style: Style) -> Style:
+    """``style`` laid out for 1920x1080 (undoes ``shorts_style``)."""
+    if not is_portrait(style):
+        return style
+    base = STYLE
+    return replace(style, width=base.width, height=base.height, font_size=base.font_size,
+                   line_height=base.line_height, max_width=base.max_width, text_center=base.text_center)
+
+
+def style_for_format(style: Style, fmt: str, clips_portrait: bool | None = None) -> Style:
+    """Pick the layout: ``shorts`` / ``landscape``, or ``auto`` to follow the clips."""
+    if fmt not in FORMATS:
+        raise ValueError(f"Unknown format {fmt!r}; use one of {', '.join(FORMATS)}")
+    if fmt == "shorts" or (fmt == "auto" and clips_portrait):
+        return shorts_style(style)
+    if fmt == "landscape" or (fmt == "auto" and clips_portrait is False):
+        return landscape_style(style)
+    return style
 
 
 def parse_color(value: str) -> tuple[int, int, int]:
@@ -136,7 +174,7 @@ def render_card(
     fill_draw, body_draw = ImageDraw.Draw(fill_mask), ImageDraw.Draw(body_mask)
     ascent, descent = font.getmetrics()
     block_h = (len(lines) - 1) * style.line_height + ascent + descent
-    y = (h - block_h) / 2
+    y = h * style.text_center - block_h / 2
     for line in lines:
         x = (w - font.getlength(line)) / 2
         fill_draw.text((x, y), line, font=font, fill=255)
@@ -763,7 +801,7 @@ def build_clip_command(
 
 
 def overscan_margins(w: int, h: int) -> tuple[int, int]:
-    """Even (x, y) margins that keep the aspect ratio: 1920x1080 -> (14, 8)."""
+    """Even (x, y) margins that keep the aspect ratio: 1920x1080 -> (14, 8), 1080x1920 -> (4, 8)."""
     my = OVERSCAN_Y
     return 2 * round(w * my / h / 2), my
 
@@ -956,7 +994,8 @@ def benchmark_routes(
     results.append(("read", read_x))
     print(f"  reading clips from source: {nbytes / took / 1e6:.1f} MB/s = {read_x:.1f}x realtime", flush=True)
 
-    plan = ClipPlan(local, sig[3], round(total * sig[3]))
+    layout = style_for_format(VIDEO_STYLE, "auto", sig[2] > sig[1])
+    plan = ClipPlan(local, sig[3], round(total * sig[3]), layout.width, layout.height)
     clips_list, cards_list = bdir / "clips.txt", bdir / "cards.txt"
     clips_list.write_text("ffconcat version 1.0\n" + "".join(concat_line(c.path.resolve()) for c in local), encoding="utf-8")
     blank = bdir / "blank.png"
@@ -1011,9 +1050,12 @@ def render_clip_video(
     probe_cache: Path | None = None,
     cpu_filters: bool = False,
     check_only: bool = False,
+    fmt: str = "auto",
 ) -> Path:
     """Render ``cues`` over the clips. ``check_only`` stops after choosing the route
-    (probing the clips and checking the GPU routes), without encoding."""
+    (probing the clips and checking the GPU routes), without encoding. ``fmt`` is
+    ``landscape`` (1920x1080), ``shorts`` (1080x1920) or ``auto`` (portrait clips make
+    a Short)."""
     clip_paths = find_clips(clips)
     infos = probe_clips(clip_paths, probe_cache)
     narration = media_duration(audio_path)
@@ -1024,6 +1066,12 @@ def render_clip_video(
         f"{sum(c.duration for c in infos):.2f}s total; narration {narration:.2f}s",
         flush=True,
     )
+    style = style_for_format(style, fmt, ch > cw)
+    if is_portrait(style):
+        print(f"YouTube Shorts format: {style.width}x{style.height} portrait", flush=True)
+        if narration > SHORTS_MAX_SECONDS:
+            print(f"Warning: the narration is {narration:.0f}s; YouTube only treats videos up to "
+                  f"{SHORTS_MAX_SECONDS}s as Shorts", flush=True)
 
     font = ImageFont.truetype(str(FONT_PATH), style.font_size)
     with tempfile.TemporaryDirectory() as tmp:
@@ -1076,8 +1124,11 @@ def render_video(
     background_clips: Path | Sequence[Path] | None = None,
     probe_cache: Path | None = None,
     cpu_filters: bool = False,
+    fmt: str = "auto",
 ) -> Path:
     """Render cues over the audio of ``audio_path`` (audio or video) into ``output_path``.
+    ``fmt``: ``landscape``, ``shorts`` (1080x1920) or ``auto`` (follow the clips;
+    landscape without clips).
 
     With ``background_clips`` (a directory of ``*.mp4`` or a list of files) the cards
     are overlaid on the concatenated clips; otherwise on chroma blue.
@@ -1090,10 +1141,10 @@ def render_video(
     if background_clips is not None:
         return render_clip_video(
             cues, audio_path, output_path, background_clips, encoder, frames_dir, style or VIDEO_STYLE, probe_cache,
-            cpu_filters,
+            cpu_filters, fmt=fmt,
         )
 
-    style = style or STYLE
+    style = style_for_format(style or STYLE, fmt)
     font = ImageFont.truetype(str(FONT_PATH), style.font_size)
     total = media_duration(audio_path)
     fps = style.fps
@@ -1137,6 +1188,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("audio", type=Path, nargs="?", help="Narration audio, or a video whose audio track is used.")
     ap.add_argument("output", type=Path, nargs="?", help="Defaults to the .srt path with an .mp4 extension.")
     ap.add_argument("--clips", type=Path, help="Directory of .mp4 clips to use as the background.")
+    ap.add_argument("--format", dest="fmt", choices=FORMATS, default="auto",
+                    help="landscape (1920x1080), shorts (1080x1920 portrait) or auto: portrait clips make a Short.")
     ap.add_argument("--tint", type=parse_color, default=VIDEO_STYLE.tint,
                     help="Colour washed over the clips behind the text (default #1E1248, deep indigo).")
     ap.add_argument("--tint-opacity", type=float, default=VIDEO_STYLE.tint_opacity,
@@ -1164,6 +1217,7 @@ def main(argv: list[str] | None = None) -> int:
         cues, args.audio, args.output or args.srt.with_suffix(".mp4"), args.encoder, args.keep_frames,
         background_clips=args.clips, cpu_filters=args.cpu_filters,
         style=replace(VIDEO_STYLE, tint=args.tint, tint_opacity=args.tint_opacity) if args.clips else None,
+        fmt=args.fmt,
     )
     print(f"Wrote {output}")
     return 0

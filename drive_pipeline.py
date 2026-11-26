@@ -5,7 +5,8 @@ Expected layout under ``--root`` (Colab: /content/drive/MyDrive/subgen):
     narration.wav       narration audio (required)
     clips/*.mp4         background clips, joined in natural filename order (required)
     script.txt          original script, used for cue wording if present (optional)
-    528Hz_ambient.m4a   background music under the narration, if present (optional)
+    528Hz_ambient.m4a   background music under the narration, if present (optional;
+                        if missing, the one in MyDrive/subgen is used)
     output/             narration.srt, narration.mp4 and narration_norm.wav are written here
 
 The narration is first loudness-normalized for YouTube (-14 LUFS, -1.5 dBTP,
@@ -31,6 +32,8 @@ Usage (Colab, after mounting Drive):
     !python -m drive_pipeline --no-music                 # no background music
     !python -m drive_pipeline --tint-opacity 0.3         # lighter indigo tint over the clips (0 = off)
     !python -m drive_pipeline --no-retime                # keep subtitle times as WhisperX gave them
+    !python -m drive_pipeline --root /content/drive/MyDrive/subgen_shorts   # a YouTube Short
+        (portrait clips make a 1080x1920 Short automatically; --format shorts/landscape forces it)
     !python -m drive_pipeline --stream-clips             # read clips from Drive during the encode
     !python -m drive_pipeline --check-routes             # just check which video route works (~1 min)
     !python -m drive_pipeline --benchmark                # time each video route and the Drive read speed
@@ -226,6 +229,11 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Strength of the tint, 0-1 (default {srt2mp4.VIDEO_STYLE.tint_opacity:g}; 0 turns it off).",
     )
     ap.add_argument(
+        "--format", dest="fmt", choices=srt2mp4.FORMATS, default="auto",
+        help="landscape (1920x1080), shorts (1080x1920 portrait for YouTube Shorts), or auto "
+             "(default): portrait clips make a Short, landscape clips a regular video.",
+    )
+    ap.add_argument(
         "--no-retime", action="store_true",
         help="Keep subtitle times as they are. By default they are snapped to the speech, "
              "including a reused SRT (the original is kept once as narration.srt.bak).",
@@ -297,7 +305,7 @@ def main(argv: list[str] | None = None) -> int:
             srt2mp4.render_clip_video(
                 [], audio, local_out / "route_check.mp4", clips_src, encoder=args.encoder,
                 work=work / "route_check", probe_cache=out_dir / ".clip_info_cache.json",
-                cpu_filters=args.cpu_filters, check_only=True,
+                cpu_filters=args.cpu_filters, check_only=True, fmt=args.fmt,
             )
             return 0
         clips = copy_clips(clips_src, work / "input" / "clips") if clips_src and not args.stream_clips else clips_src
@@ -336,7 +344,9 @@ def main(argv: list[str] | None = None) -> int:
         if not args.srt_only:
             # The music goes only into the video; transcription above used the clean narration.
             video_audio = audio
-            music_src = root / args.music
+            # A Shorts project in its own folder can share the main folder's music.
+            music_src = next((m for m in (root / args.music, DEFAULT_ROOT / args.music) if m.is_file()),
+                             root / args.music)
             if args.no_music:
                 pass
             elif music_src.is_file():
@@ -350,6 +360,7 @@ def main(argv: list[str] | None = None) -> int:
                 srt2mp4.parse_srt(srt_path), video_audio, mp4_path, encoder=args.encoder, background_clips=clips,
                 probe_cache=out_dir / ".clip_info_cache.json", cpu_filters=args.cpu_filters,
                 style=replace(srt2mp4.VIDEO_STYLE, tint=args.tint, tint_opacity=args.tint_opacity),
+                fmt=args.fmt,
             )
             print(f"Copying video to {out_dir / mp4_name}", flush=True)
             shutil.copyfile(mp4_path, out_dir / mp4_name)
