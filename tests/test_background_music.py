@@ -47,3 +47,26 @@ def test_mix_sets_music_level_and_fades_out(tmp_path):
     bm.mix(silent, music, out, level=-20, fade=4, narration_lufs=-14.0)
     assert abs(lufs(out, 2, 12) - (-34.0)) < 1.0  # the music alone, 20 LU under a -14 LUFS narration
     assert lufs(out, 18, 2) < -40  # fading out
+
+
+def test_shorts_offset_and_fade_in():
+    cmd = bm.build_mix_command(Path("n.wav"), Path("m.m4a"), Path("o.wav"), 45.0, -18.0,
+                               fade=bm.SHORTS_FADE, offset=bm.SHORTS_OFFSET, fade_in=bm.SHORTS_FADE_IN)
+    music_input = cmd.index(str(Path("m.m4a")))
+    assert cmd[music_input - 3:music_input - 1] == ["-ss", "10.000"]  # seek the music input only
+    graph = cmd[cmd.index("-filter_complex") + 1]
+    assert "afade=t=in:st=0:d=2.000000" in graph
+    assert "afade=t=out:st=43.000000:d=2.000000" in graph
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="needs ffmpeg")
+def test_offset_skips_the_start_of_the_track(tmp_path):
+    silent, music, out = tmp_path / "n.wav", tmp_path / "m.m4a", tmp_path / "mix.wav"
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=mono", "-t", "12",
+                    str(silent)], check=True)
+    # silent for its first 10 s, then noise: with the offset the music is there from the start
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                    "anoisesrc=d=30:c=pink:a=0.3,volume='if(lt(t,10),0,1)':eval=frame",
+                    "-ac", "2", "-c:a", "aac", str(music)], check=True)
+    bm.mix(silent, music, out, level=-20, fade=2, narration_lufs=-14.0, offset=10, fade_in=2)
+    assert abs(lufs(out, 3, 6) - (-34.0)) < 1.0

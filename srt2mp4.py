@@ -73,6 +73,7 @@ class Style:
     tint: tuple[int, int, int] = (0x1E, 0x12, 0x48)  # deep indigo
     tint_opacity: float = 0.0
     text_center: float = 0.5  # vertical centre of the text block, as a fraction of the height
+    text_bottom: float | None = None  # if set, the text block's bottom edge instead (it grows upward)
     pix_fmt: str = "yuv420p"
 
 
@@ -87,6 +88,15 @@ VIDEO_STYLE = replace(STYLE, stroke_width=4, shadow_offset=5, shadow_blur=3.0, s
 # along the bottom, buttons down the right).
 SHORTS_LAYOUT = dict(width=1080, height=1920, font_size=68, line_height=98, max_width=780, text_center=0.40)
 SHORTS_MAX_SECONDS = 180  # longest video YouTube accepts as a Short
+# The Shorts interface covers roughly the bottom 420 px (title, channel, description)
+# and a column of buttons down the right from about mid-height. Phrase subtitles end
+# just above the bottom area.
+SHORTS_PHRASE_BOTTOM = 1470  # px from the top of the 1920 px frame
+SHORTS_TINT_OPACITY = 0.0  # Shorts show the footage untinted by default
+
+
+def default_tint_opacity(short: bool) -> float:
+    return SHORTS_TINT_OPACITY if short else VIDEO_STYLE.tint_opacity
 FORMATS = ("auto", "landscape", "shorts")
 
 
@@ -100,9 +110,11 @@ def shorts_style(style: Style) -> Style:
 
 
 def shorts_phrase_style(style: Style) -> Style:
-    """Shorts layout with bigger text, for subtitles of a few words at a time."""
-    # Phrases are short and sit above the side buttons, so the column can be wider.
-    return replace(shorts_style(style), font_size=80, line_height=112, max_width=880)
+    """Shorts layout for subtitles of a few words at a time: bigger text, sitting at
+    the bottom just above the Shorts title / channel area (two-line phrases grow
+    upward), in a column narrow enough to clear the buttons down the right side."""
+    return replace(shorts_style(style), font_size=80, line_height=112, max_width=760,
+                   text_bottom=SHORTS_PHRASE_BOTTOM / SHORTS_LAYOUT["height"])
 
 
 def clips_are_portrait(clips: Path | Sequence[Path], probe_cache: Path | None = None) -> bool:
@@ -186,7 +198,10 @@ def render_card(
     fill_draw, body_draw = ImageDraw.Draw(fill_mask), ImageDraw.Draw(body_mask)
     ascent, descent = font.getmetrics()
     block_h = (len(lines) - 1) * style.line_height + ascent + descent
-    y = h * style.text_center - block_h / 2
+    if style.text_bottom is not None:
+        y = h * style.text_bottom - block_h
+    else:
+        y = h * style.text_center - block_h / 2
     for line in lines:
         x = (w - font.getlength(line)) / 2
         fill_draw.text((x, y), line, font=font, fill=255)
@@ -1204,8 +1219,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="landscape (1920x1080), shorts (1080x1920 portrait) or auto: portrait clips make a Short.")
     ap.add_argument("--tint", type=parse_color, default=VIDEO_STYLE.tint,
                     help="Colour washed over the clips behind the text (default #1E1248, deep indigo).")
-    ap.add_argument("--tint-opacity", type=float, default=VIDEO_STYLE.tint_opacity,
-                    help=f"Strength of the tint, 0-1 (default {VIDEO_STYLE.tint_opacity:g}; 0 turns it off).")
+    ap.add_argument("--tint-opacity", type=float, default=None,
+                    help=f"Strength of the tint, 0-1 (default {VIDEO_STYLE.tint_opacity:g}, or "
+                         f"{SHORTS_TINT_OPACITY:g} for Shorts; 0 turns it off).")
     ap.add_argument(
         "--cpu-filters", action="store_true",
         help="Skip the GPU filter routes: crop, scale and overlay on the CPU (GPU still decodes/encodes).",
@@ -1228,7 +1244,10 @@ def main(argv: list[str] | None = None) -> int:
     output = render_video(
         cues, args.audio, args.output or args.srt.with_suffix(".mp4"), args.encoder, args.keep_frames,
         background_clips=args.clips, cpu_filters=args.cpu_filters,
-        style=replace(VIDEO_STYLE, tint=args.tint, tint_opacity=args.tint_opacity) if args.clips else None,
+        style=replace(VIDEO_STYLE, tint=args.tint, tint_opacity=(
+            args.tint_opacity if args.tint_opacity is not None else default_tint_opacity(
+                args.fmt == "shorts" or (args.fmt == "auto" and clips_are_portrait(args.clips))))
+        ) if args.clips else None,
         fmt=args.fmt,
     )
     print(f"Wrote {output}")

@@ -195,8 +195,10 @@ Portrait clips make a 1080x1920 Short automatically (`--format shorts` forces it
 `--format landscape` forces 1920x1080). LTX clips at 1088x1920 are trimmed 4 px on
 each side with no scaling; 704x1280 clips are trimmed 14 px top and bottom and
 scaled up. The text is larger (68 px) in a narrower column centred a little above
-the middle, clear of the Shorts title area and side buttons, and keeps the outline
-and indigo tint. A warning is printed if the narration is longer than 3 minutes,
+the middle, clear of the Shorts title area and side buttons, and keeps the outline,
+but shows the footage untinted (`--tint-opacity 0.45` adds the indigo wash). The
+background music starts 10 s into the track and fades in over 2 s and out over the
+last 2 s (`--music-offset`, `--music-fade-in`, `--music-fade`). A warning is printed if the narration is longer than 3 minutes,
 the longest YouTube treats as a Short. On Colab, keep each Short in its own folder,
 e.g. `MyDrive/subgen_shorts/` with `narration.wav` and `clips/`, and run
 `drive_pipeline --root /content/drive/MyDrive/subgen_shorts`; the background music
@@ -204,7 +206,8 @@ from `MyDrive/subgen/` is used if that folder has none.
 
 Shorts show short phrases rather than whole sentences: each sentence is split into
 phrases of a few words (at punctuation where possible, never ending on "the", "of",
-...), shown one after another in larger text (80 px). New transcriptions save
+...), shown one after another in larger text (80 px) at the bottom of the frame, just
+above the Shorts title / channel area and clear of the side buttons. New transcriptions save
 WhisperX's word timings next to the SRT (`narration.words.json`) and each phrase is
 timed from its own words; for an older SRT without them, the sentence's text is
 spread over the stretches of speech in its time slot, switching at pauses. The
