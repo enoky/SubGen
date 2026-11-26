@@ -33,6 +33,7 @@ Usage (Colab, after mounting Drive):
     !python -m drive_pipeline --tint-opacity 0.3         # lighter indigo tint over the clips (0 = off)
     !python -m drive_pipeline --no-retime                # keep subtitle times as WhisperX gave them
     !python -m drive_pipeline --root /content/drive/MyDrive/subgen_shorts   # a YouTube Short
+        (Shorts show short phrases; --sentences shows whole sentences)
         (portrait clips make a 1080x1920 Short automatically; --format shorts/landscape forces it)
     !python -m drive_pipeline --stream-clips             # read clips from Drive during the encode
     !python -m drive_pipeline --check-routes             # just check which video route works (~1 min)
@@ -54,6 +55,7 @@ from tqdm import tqdm
 
 import background_music
 import normalize_audio
+import phrases
 import retime
 import srt2mp4
 
@@ -234,6 +236,10 @@ def build_parser() -> argparse.ArgumentParser:
              "(default): portrait clips make a Short, landscape clips a regular video.",
     )
     ap.add_argument(
+        "--sentences", action="store_true",
+        help="In Shorts, show whole sentences instead of short phrases.",
+    )
+    ap.add_argument(
         "--no-retime", action="store_true",
         help="Keep subtitle times as they are. By default they are snapped to the speech, "
              "including a reused SRT (the original is kept once as narration.srt.bak).",
@@ -274,6 +280,7 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = root / args.output
     out_dir.mkdir(parents=True, exist_ok=True)
     srt_name, mp4_name = f"{audio_src.stem}.srt", f"{audio_src.stem}.mp4"
+    words_name, phrases_name = f"{audio_src.stem}.words.json", f"{audio_src.stem}_phrases.srt"
 
     tmp = None
     if args.work:
@@ -318,6 +325,9 @@ def main(argv: list[str] | None = None) -> int:
                 raise SystemExit(f"--reuse-srt: {existing} does not exist yet.")
             shutil.copyfile(existing, srt_path)
             print(f"Reusing {existing}", flush=True)
+            (local_out / words_name).unlink(missing_ok=True)
+            if (out_dir / words_name).is_file():  # word timings from the original transcription
+                shutil.copyfile(out_dir / words_name, local_out / words_name)
             if not args.no_retime:
                 backup = existing.with_name(existing.name + ".bak")
                 if not backup.exists():
@@ -340,6 +350,8 @@ def main(argv: list[str] | None = None) -> int:
             subgen.free_torch_memory()
             shutil.copyfile(srt_path, out_dir / srt_name)
             print(f"Saved {out_dir / srt_name}", flush=True)
+            if (local_out / words_name).is_file():
+                shutil.copyfile(local_out / words_name, out_dir / words_name)
 
         if not args.srt_only:
             # The music goes only into the video; transcription above used the clean narration.
@@ -356,10 +368,22 @@ def main(argv: list[str] | None = None) -> int:
                 )
             else:
                 print(f"No background music ({music_src} not found)", flush=True)
+            style = replace(srt2mp4.VIDEO_STYLE, tint=args.tint, tint_opacity=args.tint_opacity)
+            video_srt = srt_path
+            short = args.fmt == "shorts" or (
+                args.fmt == "auto" and srt2mp4.clips_are_portrait(clips, out_dir / ".clip_info_cache.json"))
+            if short and not args.sentences:
+                # Shorts: a few words at a time, bigger. The sentence SRT stays as it is
+                # (it is the one to upload as YouTube captions).
+                video_srt = local_out / phrases_name
+                phrases.phrase_srt(audio, srt_path, video_srt, local_out / words_name)
+                shutil.copyfile(video_srt, out_dir / phrases_name)
+                print(f"Saved {out_dir / phrases_name}", flush=True)
+                style = srt2mp4.shorts_phrase_style(style)
             srt2mp4.render_video(
-                srt2mp4.parse_srt(srt_path), video_audio, mp4_path, encoder=args.encoder, background_clips=clips,
+                srt2mp4.parse_srt(video_srt), video_audio, mp4_path, encoder=args.encoder, background_clips=clips,
                 probe_cache=out_dir / ".clip_info_cache.json", cpu_filters=args.cpu_filters,
-                style=replace(srt2mp4.VIDEO_STYLE, tint=args.tint, tint_opacity=args.tint_opacity),
+                style=style,
                 fmt=args.fmt,
             )
             print(f"Copying video to {out_dir / mp4_name}", flush=True)

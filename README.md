@@ -202,6 +202,19 @@ e.g. `MyDrive/subgen_shorts/` with `narration.wav` and `clips/`, and run
 `drive_pipeline --root /content/drive/MyDrive/subgen_shorts`; the background music
 from `MyDrive/subgen/` is used if that folder has none.
 
+Shorts show short phrases rather than whole sentences: each sentence is split into
+phrases of a few words (at punctuation where possible, never ending on "the", "of",
+...), shown one after another in larger text (80 px). New transcriptions save
+WhisperX's word timings next to the SRT (`narration.words.json`) and each phrase is
+timed from its own words; for an older SRT without them, the sentence's text is
+spread over the stretches of speech in its time slot, switching at pauses. The
+sentence SRT is kept for YouTube captions, and the phrases are saved as
+`narration_phrases.srt`. `--sentences` shows whole sentences instead. On its own:
+
+```powershell
+uv run python -m phrases narration.wav narration.srt   # writes narration_phrases.srt
+```
+
 ### Background music
 
 If `MyDrive/subgen/528Hz_ambient.m4a` exists (`--music NAME` picks another file),
