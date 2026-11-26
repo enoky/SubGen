@@ -267,3 +267,53 @@ def test_tint_washes_the_clip_card_only():
     text = s.render_card("Readable", font, s.VIDEO_STYLE, transparent=True)
     assert any(px == (255, 255, 255, 255) for _, px in text.getcolors(maxcolors=1 << 24))  # text stays solid white
     assert s.render_card("Hi", font).getpixel((0, 0)) == s.STYLE.bg  # bluescreen mode unchanged
+
+
+# --- YouTube Shorts (1080x1920 portrait) -------------------------------------------
+
+SHORTS = s.style_for_format(s.VIDEO_STYLE, "shorts")
+
+
+@pytest.mark.parametrize(
+    ("size", "box"),
+    [
+        ((1088, 1920), (1080, 1920, 4, 0)),  # LTX 1088x1920: trim 4 px each side, no scaling
+        ((704, 1280), (704, 1252, 0, 14)),  # LTX 704x1280: trim 14 px top and bottom, then scale
+    ],
+)
+def test_portrait_crop_box(size, box):
+    assert s.crop_box(*size, 1080, 1920) == box
+
+
+def test_format_selection():
+    assert (SHORTS.width, SHORTS.height) == (1080, 1920)
+    assert SHORTS.tint == s.VIDEO_STYLE.tint and SHORTS.stroke_width == s.VIDEO_STYLE.stroke_width
+    auto_portrait = s.style_for_format(s.VIDEO_STYLE, "auto", clips_portrait=True)
+    assert auto_portrait == SHORTS
+    assert s.style_for_format(s.VIDEO_STYLE, "auto", clips_portrait=False) == s.VIDEO_STYLE
+    assert s.style_for_format(SHORTS, "landscape") == s.VIDEO_STYLE  # round trip
+    assert s.style_for_format(s.VIDEO_STYLE, "landscape", clips_portrait=True) == s.VIDEO_STYLE
+    with pytest.raises(ValueError):
+        s.style_for_format(s.VIDEO_STYLE, "square")
+
+
+def test_shorts_overscan_and_gpu_command():
+    assert s.overscan_margins(1080, 1920) == (4, 8)
+    plan = s.plan_clips([clip(w=704, h=1280)], 30.0, SHORTS)
+    assert (plan.out_w, plan.out_h) == (1080, 1920)
+    cmd = build(plan, "gpu_overscan_canvas")
+    graph = cmd[cmd.index("-filter_complex") + 1]
+    assert "-crop 14x14x0x0" in " ".join(cmd)
+    assert "scale_cuda=w=1088:h=1936" in graph and "overlay_cuda=x=-4:y=-8" in graph
+    assert any(a.startswith("color=c=black:s=1080x1920") for a in cmd)
+
+
+def test_shorts_text_stays_in_the_safe_area():
+    font = s.ImageFont.truetype(str(s.FONT_PATH), SHORTS.font_size)
+    long = ("Reason can't lift the veil of the unknowable, the Initiates said, but it can tell us "
+            "certain things the mind is compelled to accept.")
+    card = s.render_card(long, font, SHORTS, transparent=True)
+    assert card.size == (1080, 1920)
+    left, top, right, bottom = card.getchannel("A").point(lambda v: 255 if v > 200 else 0).getbbox()
+    assert left >= 100 and right <= 980  # clear of the edges and the right-hand Shorts buttons
+    assert bottom < 1500  # above the Shorts title / channel area
