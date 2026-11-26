@@ -70,7 +70,7 @@ def test_music_mix_reused_until_something_changes(tmp_path, monkeypatch):
     music.write_bytes(b"music")
     calls = []
 
-    def fake_mix(n, m, out, level, fade, n_lufs, tp):
+    def fake_mix(n, m, out, level, fade, n_lufs, tp, offset=0.0, fade_in=0.0):
         calls.append(level)
         out.write_bytes(b"mix")
         return out
@@ -83,6 +83,8 @@ def test_music_mix_reused_until_something_changes(tmp_path, monkeypatch):
     assert len(calls) == 1  # reused
     dp.mixed_narration(narration, music, work_in, -24, 8, -14, -1.5)
     assert calls[-1] == -24 and len(calls) == 2  # level changed
+    dp.mixed_narration(narration, music, work_in, -24, 2, -14, -1.5, offset=10, fade_in=2)
+    assert len(calls) == 3  # Shorts settings (offset, fades) changed
 
 
 def test_colab_detection(monkeypatch, tmp_path):

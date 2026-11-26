@@ -317,3 +317,20 @@ def test_shorts_text_stays_in_the_safe_area():
     left, top, right, bottom = card.getchannel("A").point(lambda v: 255 if v > 200 else 0).getbbox()
     assert left >= 100 and right <= 980  # clear of the edges and the right-hand Shorts buttons
     assert bottom < 1500  # above the Shorts title / channel area
+
+
+def test_shorts_phrases_sit_at_the_bottom_above_the_shorts_title_area():
+    style = s.shorts_phrase_style(s.VIDEO_STYLE)
+    font = s.ImageFont.truetype(str(s.FONT_PATH), style.font_size)
+    one = s.render_card("Reason", font, style, transparent=True)
+    two = s.render_card("the veil of the unknowable,", font, style, transparent=True)
+    box1 = one.getchannel("A").point(lambda v: 255 if v > 200 else 0).getbbox()
+    box2 = two.getchannel("A").point(lambda v: 255 if v > 200 else 0).getbbox()
+    assert 1400 < box1[3] < 1500 and abs(box1[3] - box2[3]) < 15  # same bottom line; two lines grow upward
+    assert box2[1] < box1[1]
+    assert box2[0] > 140 and box2[2] < 930  # clear of the right-hand Shorts buttons
+
+
+def test_shorts_default_to_no_tint():
+    assert s.default_tint_opacity(short=True) == 0.0
+    assert s.default_tint_opacity(short=False) == s.VIDEO_STYLE.tint_opacity

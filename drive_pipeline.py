@@ -30,7 +30,7 @@ Usage (Colab, after mounting Drive):
     !python -m drive_pipeline --no-normalize             # use narration.wav as is
     !python -m drive_pipeline --music-level -24          # quieter background music
     !python -m drive_pipeline --no-music                 # no background music
-    !python -m drive_pipeline --tint-opacity 0.3         # lighter indigo tint over the clips (0 = off)
+    !python -m drive_pipeline --tint-opacity 0.3         # lighter indigo tint (Shorts default to no tint)
     !python -m drive_pipeline --no-retime                # keep subtitle times as WhisperX gave them
     !python -m drive_pipeline --root /content/drive/MyDrive/subgen_shorts   # a YouTube Short
         (Shorts show short phrases; --sentences shows whole sentences)
@@ -159,7 +159,7 @@ MIX_META = ".narration_mix.json"
 
 def mixed_narration(
     narration: Path, music_src: Path, work_in: Path, level: float, fade: float,
-    narration_lufs: float | None, true_peak: float,
+    narration_lufs: float | None, true_peak: float, offset: float = 0.0, fade_in: float = 0.0,
 ) -> Path:
     """``narration`` with the background music mixed under it, reused within the
     session while the narration, the music and the settings are unchanged. (The mix
@@ -169,7 +169,7 @@ def mixed_narration(
         return {"name": p.name, "size": st.st_size, "mtime_ns": st.st_mtime_ns}
 
     key = {"narration": stamp(narration), "music": stamp(music_src), "level": level, "fade": fade,
-           "narration_lufs": narration_lufs, "true_peak": true_peak}
+           "narration_lufs": narration_lufs, "true_peak": true_peak, "offset": offset, "fade_in": fade_in}
     out, meta = work_in / f"{narration.stem.removesuffix(normalize_audio.SUFFIX)}_mix.wav", work_in / MIX_META
     try:
         if out.is_file() and json.loads(meta.read_text(encoding="utf-8")) == key:
@@ -180,7 +180,7 @@ def mixed_narration(
     meta.unlink(missing_ok=True)
     print(f"Mixing {music_src.name} under the narration", flush=True)
     music = copy_in(music_src, work_in)
-    background_music.mix(narration, music, out, level, fade, narration_lufs, true_peak)
+    background_music.mix(narration, music, out, level, fade, narration_lufs, true_peak, offset, fade_in)
     meta.write_text(json.dumps(key), encoding="utf-8")
     return out
 
@@ -263,16 +263,28 @@ def build_parser() -> argparse.ArgumentParser:
              "about -18 to -25 suits music under voice-over).",
     )
     ap.add_argument(
-        "--music-fade", type=float, default=background_music.DEFAULT_FADE,
-        help=f"Music fade-out at the end of the video, in seconds (default {background_music.DEFAULT_FADE:g}).",
+        "--music-fade", type=float, default=None,
+        help=f"Music fade-out at the end, in seconds (default {background_music.DEFAULT_FADE:g}, "
+             f"or {background_music.SHORTS_FADE:g} for Shorts).",
+    )
+    ap.add_argument(
+        "--music-fade-in", type=float, default=None,
+        help=f"Music fade-in at the start, in seconds (default 0, or {background_music.SHORTS_FADE_IN:g} "
+             "for Shorts; the track has its own fade-in when it starts from the beginning).",
+    )
+    ap.add_argument(
+        "--music-offset", type=float, default=None,
+        help=f"Start the music this many seconds into the file (default 0, or "
+             f"{background_music.SHORTS_OFFSET:g} for Shorts).",
     )
     ap.add_argument(
         "--tint", type=srt2mp4.parse_color, default=srt2mp4.VIDEO_STYLE.tint,
         help="Colour washed over the clips behind the text to darken them (default #1E1248, deep indigo).",
     )
     ap.add_argument(
-        "--tint-opacity", type=float, default=srt2mp4.VIDEO_STYLE.tint_opacity,
-        help=f"Strength of the tint, 0-1 (default {srt2mp4.VIDEO_STYLE.tint_opacity:g}; 0 turns it off).",
+        "--tint-opacity", type=float, default=None,
+        help=f"Strength of the tint, 0-1 (default {srt2mp4.VIDEO_STYLE.tint_opacity:g}, or "
+             f"{srt2mp4.SHORTS_TINT_OPACITY:g} for Shorts; 0 turns it off).",
     )
     ap.add_argument(
         "--format", dest="fmt", choices=srt2mp4.FORMATS, default="auto",
@@ -398,6 +410,12 @@ def main(argv: list[str] | None = None) -> int:
             shutil.copyfile(local_out / words_name, out_dir / words_name)
 
     if not args.srt_only:
+        short = args.fmt == "shorts" or (
+            args.fmt == "auto" and srt2mp4.clips_are_portrait(clips, out_dir / ".clip_info_cache.json"))
+
+        def pick(value: float | None, landscape: float, shorts: float) -> float:
+            return value if value is not None else (shorts if short else landscape)
+
         # The music goes only into the video; transcription above used the clean narration.
         video_audio = audio
         # A Shorts project in its own folder can share the main folder's music.
@@ -407,17 +425,21 @@ def main(argv: list[str] | None = None) -> int:
             pass
         elif music_src.is_file():
             video_audio = mixed_narration(
-                audio, music_src, work / "input", args.music_level, args.music_fade,
+                audio, music_src, work / "input", args.music_level,
+                pick(args.music_fade, background_music.DEFAULT_FADE, background_music.SHORTS_FADE),
                 None if args.no_normalize else args.lufs, args.true_peak,
+                offset=pick(args.music_offset, 0.0, background_music.SHORTS_OFFSET),
+                fade_in=pick(args.music_fade_in, 0.0, background_music.SHORTS_FADE_IN),
             )
         else:
             print(f"No background music ({music_src} not found)", flush=True)
-        style = replace(srt2mp4.VIDEO_STYLE, tint=args.tint, tint_opacity=args.tint_opacity)
+        style = replace(srt2mp4.VIDEO_STYLE, tint=args.tint, tint_opacity=pick(
+            args.tint_opacity, srt2mp4.VIDEO_STYLE.tint_opacity, srt2mp4.SHORTS_TINT_OPACITY))
+        if short:
+            style = srt2mp4.shorts_style(style)
         video_srt = srt_path
-        short = args.fmt == "shorts" or (
-            args.fmt == "auto" and srt2mp4.clips_are_portrait(clips, out_dir / ".clip_info_cache.json"))
         if short and not args.sentences:
-            # Shorts: a few words at a time, bigger. The sentence SRT stays as it is
+            # Shorts: a few words at a time, bigger, at the bottom. The sentence SRT stays as it is
             # (it is the one to upload as YouTube captions).
             video_srt = local_out / phrases_name
             phrases.phrase_srt(audio, srt_path, video_srt, local_out / words_name)
