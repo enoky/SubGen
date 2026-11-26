@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import difflib
+import json
 import gc
 import logging
 import re
@@ -1102,6 +1103,18 @@ def retime_cues(
     return [replace(cue, start=s, end=e) for cue, (s, e) in zip(cues, new)]
 
 
+def write_word_timings(aligned: dict[str, Any], srt_path: Path) -> Path:
+    """Save WhisperX's word timings next to the SRT (``<stem>.words.json``) as
+    ``[[word, start, end], ...]`` (null where a word could not be aligned), so phrase
+    subtitles can later be timed word by word, even from a reused SRT."""
+    _, timed_words = build_timed_words(aligned)
+    path = srt_path.with_suffix(".words.json")
+    rows = [[w.text, None if w.start is None else round(w.start, 3), None if w.end is None else round(w.end, 3)]
+            for w in timed_words]
+    path.write_text(json.dumps(rows), encoding="utf-8")
+    return path
+
+
 def write_srt(cues: list[SentenceCue], output_path: Path) -> None:
     subtitles = [
         srt.Subtitle(
@@ -1146,6 +1159,8 @@ def main(argv: list[str] | None = None) -> int:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     write_srt(cues, output_path)
     print(f"Wrote {len(cues)} sentence-level subtitles to {output_path}")
+    words_path = write_word_timings(aligned, output_path)
+    print(f"Wrote word timings to {words_path} (used for short-phrase subtitles)")
 
     if args.mp4 or args.mp4_output or args.background_clips:
         import srt2mp4

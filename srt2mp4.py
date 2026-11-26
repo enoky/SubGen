@@ -99,6 +99,18 @@ def shorts_style(style: Style) -> Style:
     return style if is_portrait(style) else replace(style, **SHORTS_LAYOUT)
 
 
+def shorts_phrase_style(style: Style) -> Style:
+    """Shorts layout with bigger text, for subtitles of a few words at a time."""
+    # Phrases are short and sit above the side buttons, so the column can be wider.
+    return replace(shorts_style(style), font_size=80, line_height=112, max_width=880)
+
+
+def clips_are_portrait(clips: Path | Sequence[Path], probe_cache: Path | None = None) -> bool:
+    """Whether most of the clips are taller than they are wide."""
+    _, w, h, _, _ = majority_signature(probe_clips(find_clips(clips), probe_cache))
+    return h > w
+
+
 def landscape_style(style: Style) -> Style:
     """``style`` laid out for 1920x1080 (undoes ``shorts_style``)."""
     if not is_portrait(style):
