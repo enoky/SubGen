@@ -83,3 +83,37 @@ def test_music_mix_reused_until_something_changes(tmp_path, monkeypatch):
     assert len(calls) == 1  # reused
     dp.mixed_narration(narration, music, work_in, -24, 8, -14, -1.5)
     assert calls[-1] == -24 and len(calls) == 2  # level changed
+
+
+def test_colab_detection(monkeypatch, tmp_path):
+    monkeypatch.setenv("COLAB_RELEASE_TAG", "release-colab_2026")
+    assert dp.on_colab() and dp.default_root() == dp.DEFAULT_ROOT
+    assert dp.default_work_dir(tmp_path) == dp.Path("/content/subgen-work")
+
+
+def test_local_defaults(monkeypatch, tmp_path):
+    monkeypatch.delenv("COLAB_RELEASE_TAG", raising=False)
+    monkeypatch.setattr(dp, "on_colab", lambda: False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "appdata"))
+    project = tmp_path / "videos" / "subgen_shorts"
+    project.mkdir(parents=True)
+
+    monkeypatch.chdir(project)
+    assert dp.default_root() is None  # no narration here yet
+    (project / "narration.wav").write_bytes(b"")
+    assert dp.default_root() == project
+
+    work = dp.default_work_dir(project)
+    assert work.parent == tmp_path / "appdata" / "SubGen" / "work"
+    assert work.name.startswith("subgen_shorts-")
+    assert dp.default_work_dir(project) == work  # stable between runs
+    assert dp.default_work_dir(tmp_path / "videos" / "other") != work
+
+
+def test_music_found_in_the_main_folder_next_to_a_shorts_folder(tmp_path):
+    shorts = tmp_path / "subgen_shorts"
+    cands = dp.music_candidates(shorts, "528Hz_ambient.m4a")
+    assert cands[0] == shorts / "528Hz_ambient.m4a"
+    assert cands[1] == tmp_path / "subgen" / "528Hz_ambient.m4a"
+    main = dp.music_candidates(tmp_path / "subgen", "m.m4a")  # already the main folder: no duplicate
+    assert main == [tmp_path / "subgen" / "m.m4a", dp.DEFAULT_ROOT / "m.m4a"]

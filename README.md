@@ -237,6 +237,27 @@ uv run python -m normalize_audio narration.wav            # writes narration_nor
 uv run python -m normalize_audio *.wav --lufs -16
 ```
 
+### Running locally (e.g. a laptop with an NVIDIA GPU)
+
+The Drive pipeline works on any folder with the same layout (`narration.wav`,
+`clips/`, optional `script.txt` and music, `output/`):
+
+```powershell
+uv run python -m drive_pipeline --root D:\videos\subgen
+cd D:\videos\subgen_shorts; uv run --project C:\path\to\SubGen python -m drive_pipeline
+```
+
+Away from Colab it reads clips in place (`--copy-clips` copies them first, which helps
+for a Google Drive for desktop folder that isn't available offline), keeps its
+working files and caches in `%LOCALAPPDATA%\SubGen\work\` (`~/.cache/SubGen/work/`
+on Linux and macOS), one folder per project, and finds the background music in a
+neighbouring `subgen` folder if the project has none. Without `--root` it uses the
+current folder if it contains `narration.wav`. GPUs under 6 GB (e.g. a laptop RTX
+3050) get lighter transcription settings automatically; add `--model
+large-v3-turbo` if one still runs out of memory. ffmpeg needs NVENC/NVDEC (the BtbN
+win64-gpl build has everything); `uv run python -m srt2mp4 --check` shows what it
+supports. AV1 encoding (the optional notebook cells) needs an RTX 40-series GPU.
+
 ### Google Cloud Run
 
 The `Dockerfile` packages the web UI for Cloud Run on an NVIDIA L4 GPU, with
